@@ -1,0 +1,21 @@
+# LQL Array Support Expansion (Recommended)
+
+- [ ] Define selector wildcard semantics
+  - [ ] Support `*` path segments in selectors (e.g. `/items/*/sku="ABC123"`).
+  - [ ] Support bracket sugar: `/items[]/sku="ABC123"` == `/items/*/sku="ABC123"`.
+  - [ ] Define `*`/`[]` as "any element" for arrays; empty arrays yield no match.
+  - [ ] Define behavior when `*`/`[]` appears under objects (error vs no match).
+  - [ ] Document that multiple wildcards imply nested "any" semantics.
+- [ ] Extend selector parser + evaluator
+  - [ ] Accept `*` and `[]` in shorthand selector paths.
+  - [ ] Update `valueAtPath`/matcher to traverse arrays for `*`/`[]`.
+  - [ ] Add tests for mixed arrays/objects and nested wildcards.
+- [ ] Add array mutation semantics using selector scoping
+  - [ ] Allow `-m` paths with `*`/`[]` to apply to matching elements only.
+  - [ ] Define selector scoping: selector matches element scope when mutation path contains `*`/`[]`.
+  - [ ] Missing paths inside matched elements should be skipped (no-op).
+  - [ ] Add tests for: match+mutate, skip non-matching elements, nested arrays.
+- [ ] Update docs and CLI help
+  - [ ] Add selector examples with `*` and `[]`.
+  - [ ] Add mutation examples showing selector-scoped array updates.
+  - [ ] Clarify performance notes and limitations.

@@ -1,0 +1,171 @@
+# lql
+
+LQL (Lockd Query Language) provides a compact selector and mutation syntax for
+JSON documents. This module includes:
+
+- A Go library for parsing selectors and mutations, plus selector evaluation.
+- A CLI (`cmd/lql`) for selecting JSON documents, applying mutations, and
+  formatting output via prettyx.
+
+## Install
+
+```bash
+go get pkt.systems/lql@latest
+```
+
+## Library usage
+
+### Selectors
+
+Selectors are declarative predicates built over JSON Pointer fields.
+
+```go
+sel, err := lql.ParseSelectorString(`
+  and.eq{field=/status,value=open},
+  and.range{field=/progress,gte=50}
+`)
+if err != nil {
+  log.Fatal(err)
+}
+
+doc := map[string]any{
+  "status":   "open",
+  "progress": 72,
+}
+
+if lql.Matches(sel, doc) {
+  fmt.Println("match")
+}
+```
+
+Shorthand forms are supported:
+
+```go
+sel, _ := lql.ParseSelectorString(`/status="open",/progress>=50`)
+```
+
+Array element selection is supported via JSON Pointer indices:
+
+```go
+sel, _ := lql.ParseSelectorString(`/devices/0/status="online"`)
+```
+
+### Mutations
+
+Mutations modify JSON objects in-place.
+
+```go
+doc := map[string]any{
+  "state": map[string]any{
+    "status":  "queued",
+    "retries": 1,
+  },
+}
+
+if err := lql.Mutate(doc,
+  "/state/status=running",
+  "/state/retries=+2",
+  "rm:/state/legacy",
+); err != nil {
+  log.Fatal(err)
+}
+```
+
+Brace shorthand applies multiple mutations under a prefix:
+
+```go
+_ = lql.Mutate(doc, `/state{/owner="alice",/note="hi"}`)
+```
+
+Time-prefixed mutations normalize timestamps to RFC3339Nano:
+
+```go
+_ = lql.MutateWithTime(doc, time.Now(), `time:/state/updated=NOW`)
+```
+
+Note: mutations do not support JSON array traversal or updates.
+
+## CLI usage
+
+```
+usage: lql [-m mutator...] [-f field...] selector... [data.json]
+   or: lql selector... < data.json
+   or: cat data.json | lql selector...
+```
+
+Selectors determine which JSON documents to output. The matching documents are
+printed in full by default. If the input is a JSON array, each element is
+treated as a candidate document.
+
+Mutations apply to a single JSON object. When selectors are provided alongside
+`-m`, the mutations are applied only if the selector matches. Output always
+contains the full (possibly mutated) object unless `-f` is used.
+
+### Selection examples
+
+Select documents matching a status and region:
+
+```bash
+lql '/status="open",/region="us-west"' data.json
+```
+
+Select only a few fields from matching documents:
+
+```bash
+lql '/status="open"' -f /id -f /status -f /region data.json
+```
+
+Filter array input (each element is evaluated):
+
+```bash
+cat devices.json | lql '/telemetry/battery_mv<3600'
+```
+
+Match on array elements inside each document:
+
+```bash
+lql '/devices/0/status="online"' data.json
+```
+
+### Mutation examples
+
+Apply mutations conditionally:
+
+```bash
+lql -m '/state/retries++' -m '/state/status=running' '/state/status="queued"' state.json
+```
+
+Apply mutations and emit only selected fields:
+
+```bash
+lql -m '/state/retries=+3' -f /state/retries -f /state/status state.json
+```
+
+Note: mutations only work on JSON objects and do not support array traversal.
+
+Write mutations inline:
+
+```bash
+lql -m '/state/status=done' -i state.json
+```
+
+### Output formatting
+
+By default, output is pretty-printed using prettyx. Use `-c` for compact
+one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
+
+## Selector grammar overview
+
+- Logical: `and`, `or`, `not`
+- Clauses: `eq`, `prefix`, `range`, `in`, `exists`
+- JSON Pointer fields: `/path/to/field`
+- Shorthand: `/field=value`, `/field!=value`, `/field>=10`, `/field<5`
+- Arrays: `/items/0/sku="ABC-123"`
+
+## Mutation grammar overview
+
+- Set: `/path=value`
+- Increment: `/path++`, `/path--`, `/path=+3`, `/path=-2`
+- Remove: `rm:/path`, `delete:/path`
+- Time: `time:/path=NOW` or RFC3339 timestamp
+- Brace: `/path{/a=1,/b=2}`

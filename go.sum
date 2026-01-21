@@ -1,0 +1,11 @@
+github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
+github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
+golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.40.0 h1:DBZZqJ2Rkml6QMQsZywtnjnnGvHza6BTfYFWY9kjEWQ=
+golang.org/x/sys v0.40.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
+pkt.systems/jpact v0.1.0 h1:n32yNDCX7OYDPGTFvChEJ4wfFfpf0J+rARV6Nqb+mVA=
+pkt.systems/jpact v0.1.0/go.mod h1:8tpJyY0bdATRRNcqYKXlBg7H7cRXjDJAiKLjdMZD/M4=
+pkt.systems/prettyx v0.4.0 h1:pSw3McBTr3hqsHHftVvGyYzRkrL1Yp+LILOAwyDnoUw=
+pkt.systems/prettyx v0.4.0/go.mod h1:yx4YUJUyt90fiV9xOqhdKbyt3CgnVB0qZWQfIf7qOD0=
+pkt.systems/version v0.4.0 h1:UBIdsvKM3Lrzk4c7RtzhBVbmYt37TfzmXOiDZ/LlsPg=
+pkt.systems/version v0.4.0/go.mod h1:ktfpP3nZ1t2/Ua0kYCVksBpP6Za+OSMJ3O/IWzSf5Ak=
