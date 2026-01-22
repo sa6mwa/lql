@@ -93,6 +93,9 @@ usage: lql [-m mutator...] [-f field...] selector... [data.json]
    or: cat data.json | lql selector...
 ```
 
+By default, multiple selector arguments are combined with AND. Use `-O` (or
+`-or`) to combine them with OR.
+
 Selectors determine which JSON documents to output. The matching documents are
 printed in full by default. If the input is a JSON array, each element is
 treated as a candidate document.

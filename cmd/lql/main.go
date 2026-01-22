@@ -47,6 +47,7 @@ func main() {
 	var cfg config
 	var showHelp bool
 	var showVersion bool
+	var orMode bool
 
 	flags := flag.NewFlagSet("lql", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -58,6 +59,8 @@ func main() {
 	flags.StringVar(&cfg.theme, "t", "", "prettyx palette name")
 	flags.BoolVar(&showHelp, "h", false, "show help")
 	flags.BoolVar(&showVersion, "v", false, "show version")
+	flags.BoolVar(&orMode, "O", false, "combine selector arguments with OR")
+	flags.BoolVar(&orMode, "or", false, "alias of -O")
 	flags.Usage = func() {}
 
 	if err := flags.Parse(os.Args[1:]); err != nil {
@@ -95,7 +98,7 @@ func main() {
 
 	var selector lql.Selector
 	if len(selectors) > 0 {
-		selector, err = lql.ParseSelectorString(strings.Join(selectors, "\n"))
+		selector, err = buildSelector(selectors, orMode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "lql: %v\n", err)
 			os.Exit(2)
@@ -516,6 +519,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -t theme         Prettyx theme name (use with color terminals).")
 	fmt.Fprintln(w, "  -h               Show help.")
 	fmt.Fprintln(w, "  -v               Show version.")
+	fmt.Fprintln(w, "  -O, -or          Combine selector arguments with OR.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Themes:")
 	writeWrappedList(w, "  ", prettyx.PaletteNames(), 80)
@@ -533,7 +537,42 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  not.eq{field=/state,value=disabled}")
 	fmt.Fprintln(w, "  exists{/metadata/etag}")
 	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Selector OR example:")
+	fmt.Fprintln(w, "  lql -O '/status=\"open\"' '/status=\"queued\"' data.json")
+	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Note: mutations only work on JSON objects and do not support array traversal.")
+}
+
+func buildSelector(args []string, orMode bool) (lql.Selector, error) {
+	if len(args) == 0 {
+		return lql.Selector{}, nil
+	}
+	if !orMode {
+		return lql.ParseSelectorString(strings.Join(args, "\n"))
+	}
+	clauses := make([]lql.Selector, 0, len(args))
+	for _, raw := range args {
+		expr := strings.TrimSpace(raw)
+		if expr == "" {
+			continue
+		}
+		sel, err := lql.ParseSelectorString(expr)
+		if err != nil {
+			return lql.Selector{}, err
+		}
+		if sel.IsEmpty() {
+			continue
+		}
+		clauses = append(clauses, sel)
+	}
+	switch len(clauses) {
+	case 0:
+		return lql.Selector{}, nil
+	case 1:
+		return clauses[0], nil
+	default:
+		return lql.Selector{Or: clauses}, nil
+	}
 }
 
 func writeWrappedList(w io.Writer, prefix string, items []string, width int) {
