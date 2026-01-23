@@ -31,6 +31,21 @@
 //	/devices/0/status="online"
 //	/items/2/sku="ABC-123"
 //
+// Wildcards (selector paths):
+//
+//   - any child value of an object (objects only; arrays do not match)
+//     []  any element of an array (arrays only; objects do not match)
+//     **  any child (object value or array element)
+//     ... recursive descent (any depth, objects or arrays)
+//
+// Type mismatches do not match (e.g. [] on an object). Bracket sugar expands
+// "/items[]/sku" to "/items/[]/sku".
+//
+//	/labels/*="production"
+//	/items[]/sku="ABC-123"
+//	/items/**/sku="ABC-123"
+//	/items/.../sku="ABC-123"
+//
 // Example:
 //
 //	sel, _ := lql.ParseSelectorString(`/status="open",/progress>=50`)
@@ -49,7 +64,8 @@
 //	rm:/state/legacy             # delete
 //	time:/state/updated=NOW      # RFC3339 timestamp
 //
-// Mutations do not support JSON array traversal or updates.
+// Mutations support the same wildcard semantics as selectors. When a wildcard
+// path segment is used, missing paths under matched nodes are skipped.
 //
 // Brace shorthand applies a set of nested mutations under a prefix:
 //

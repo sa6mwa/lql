@@ -529,6 +529,10 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  /status!=closed")
 	fmt.Fprintln(w, "  /progress>=50")
 	fmt.Fprintln(w, "  /devices/0/status=\"online\"")
+	fmt.Fprintln(w, "  /labels/*=\"production\"")
+	fmt.Fprintln(w, "  /items[]/sku=\"ABC-123\"")
+	fmt.Fprintln(w, "  /items/**/sku=\"ABC-123\"")
+	fmt.Fprintln(w, "  /items/.../sku=\"ABC-123\"")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Selector examples (full LQL):")
 	fmt.Fprintln(w, "  eq{field=/status,value=open}")
@@ -540,7 +544,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Selector OR example:")
 	fmt.Fprintln(w, "  lql -O '/status=\"open\"' '/status=\"queued\"' data.json")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Note: mutations only work on JSON objects and do not support array traversal.")
+	fmt.Fprintln(w, "Note: mutations apply to a JSON object root, but paths may traverse arrays.")
 }
 
 func buildSelector(args []string, orMode bool) (lql.Selector, error) {

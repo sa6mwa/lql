@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"pkt.systems/lql/jsonpointer"
 )
 
 // MutationKind identifies the operation applied to a JSON path.
@@ -261,7 +259,7 @@ func splitPath(path string) ([]string, error) {
 	if !strings.HasPrefix(path, "/") {
 		return nil, fmt.Errorf("mutation path %q must start with '/'", path)
 	}
-	segments, err := jsonpointer.Split(path)
+	segments, err := selectorPathSegments(path)
 	if err != nil {
 		return nil, err
 	}
@@ -323,6 +321,9 @@ func applyMutation(doc map[string]any, mut Mutation) error {
 	if len(mut.Path) == 0 {
 		return fmt.Errorf("mutation has empty path")
 	}
+	if pathHasWildcard(mut.Path) {
+		return applyMutationWildcard(doc, mut)
+	}
 	create := mut.Kind != MutationRemove
 	parent, key, err := navigate(doc, mut.Path, create)
 	if err != nil {
@@ -359,30 +360,281 @@ func navigate(root map[string]any, path []string, create bool) (map[string]any, 
 	if len(path) == 0 {
 		return nil, "", fmt.Errorf("empty path")
 	}
-	current := root
+	var current any = root
 	for i := 0; i < len(path)-1; i++ {
-		key := path[i]
-		next, ok := current[key]
-		if !ok {
-			if !create {
+		segment := path[i]
+		switch node := current.(type) {
+		case map[string]any:
+			next, ok := node[segment]
+			if !ok {
+				if !create {
+					return nil, "", fmt.Errorf("path %s does not exist", strings.Join(path[:i+1], "."))
+				}
+				child := make(map[string]any)
+				node[segment] = child
+				current = child
+				continue
+			}
+			child, ok := next.(map[string]any)
+			if !ok {
+				if !create {
+					return nil, "", fmt.Errorf("path %s is not an object", strings.Join(path[:i+1], "."))
+				}
+				child = make(map[string]any)
+				node[segment] = child
+			}
+			current = child
+		case []any:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(node) {
 				return nil, "", fmt.Errorf("path %s does not exist", strings.Join(path[:i+1], "."))
 			}
-			child := make(map[string]any)
-			current[key] = child
-			current = child
-			continue
+			current = node[index]
+		default:
+			return nil, "", fmt.Errorf("path %s is not an object", strings.Join(path[:i+1], "."))
 		}
-		child, ok := next.(map[string]any)
-		if !ok {
-			if !create {
-				return nil, "", fmt.Errorf("path %s is not an object", strings.Join(path[:i+1], "."))
-			}
-			child = make(map[string]any)
-			current[key] = child
-		}
-		current = child
 	}
-	return current, path[len(path)-1], nil
+	obj, ok := current.(map[string]any)
+	if !ok {
+		return nil, "", fmt.Errorf("path %s is not an object", strings.Join(path[:len(path)-1], "."))
+	}
+	return obj, path[len(path)-1], nil
+}
+
+func pathHasWildcard(path []string) bool {
+	for _, segment := range path {
+		switch segment {
+		case "*", "[]", "**", "...":
+			return true
+		}
+	}
+	return false
+}
+
+func applyMutationWildcard(root map[string]any, mut Mutation) error {
+	return applyMutationAtPath(root, mut.Path, mut)
+}
+
+func applyMutationAtPath(node any, path []string, mut Mutation) error {
+	if len(path) == 0 {
+		return nil
+	}
+	segment := path[0]
+	last := len(path) == 1
+	switch segment {
+	case "*":
+		obj, ok := node.(map[string]any)
+		if !ok {
+			return nil
+		}
+		if last {
+			for key := range obj {
+				if err := applyMutationToMapKey(obj, key, mut, true); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, child := range obj {
+			if err := applyMutationAtPath(child, path[1:], mut); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "[]":
+		arr, ok := node.([]any)
+		if !ok {
+			return nil
+		}
+		if last {
+			for i := range arr {
+				if err := applyMutationToArray(arr, i, mut, true); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, child := range arr {
+			if err := applyMutationAtPath(child, path[1:], mut); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "**":
+		switch v := node.(type) {
+		case map[string]any:
+			if last {
+				for key := range v {
+					if err := applyMutationToMapKey(v, key, mut, true); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			for _, child := range v {
+				if err := applyMutationAtPath(child, path[1:], mut); err != nil {
+					return err
+				}
+			}
+		case []any:
+			if last {
+				for i := range v {
+					if err := applyMutationToArray(v, i, mut, true); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			for _, child := range v {
+				if err := applyMutationAtPath(child, path[1:], mut); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	case "...":
+		if last {
+			return applyMutationRecursiveDesc(node, mut)
+		}
+		return applyMutationRecursivePath(node, path[1:], mut)
+	default:
+		if last {
+			switch v := node.(type) {
+			case map[string]any:
+				return applyMutationToMapKey(v, segment, mut, true)
+			case []any:
+				index, err := strconv.Atoi(segment)
+				if err != nil || index < 0 || index >= len(v) {
+					return nil
+				}
+				return applyMutationToArray(v, index, mut, true)
+			default:
+				return nil
+			}
+		}
+		switch v := node.(type) {
+		case map[string]any:
+			child, ok := v[segment]
+			if !ok {
+				return nil
+			}
+			return applyMutationAtPath(child, path[1:], mut)
+		case []any:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(v) {
+				return nil
+			}
+			return applyMutationAtPath(v[index], path[1:], mut)
+		default:
+			return nil
+		}
+	}
+}
+
+func applyMutationRecursiveDesc(node any, mut Mutation) error {
+	switch v := node.(type) {
+	case map[string]any:
+		for key := range v {
+			if err := applyMutationToMapKey(v, key, mut, true); err != nil {
+				return err
+			}
+		}
+		for _, child := range v {
+			if err := applyMutationRecursiveDesc(child, mut); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for i := range v {
+			if err := applyMutationToArray(v, i, mut, true); err != nil {
+				return err
+			}
+		}
+		for _, child := range v {
+			if err := applyMutationRecursiveDesc(child, mut); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func applyMutationRecursivePath(node any, path []string, mut Mutation) error {
+	if err := applyMutationAtPath(node, path, mut); err != nil {
+		return err
+	}
+	switch v := node.(type) {
+	case map[string]any:
+		for _, child := range v {
+			if err := applyMutationRecursivePath(child, path, mut); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if err := applyMutationRecursivePath(child, path, mut); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func applyMutationToMapKey(obj map[string]any, key string, mut Mutation, skipMissing bool) error {
+	existing, ok := obj[key]
+	if !ok && skipMissing {
+		return nil
+	}
+	switch mut.Kind {
+	case MutationSet:
+		if ok || !skipMissing {
+			obj[key] = mut.Value
+		}
+	case MutationIncrement:
+		if !ok {
+			if skipMissing {
+				return nil
+			}
+			obj[key] = normalizeNumber(mut.Delta)
+			return nil
+		}
+		num, ok := toFloat(existing)
+		if !ok {
+			return fmt.Errorf("value at %s is not numeric", key)
+		}
+		obj[key] = normalizeNumber(num + mut.Delta)
+	case MutationRemove:
+		if ok {
+			delete(obj, key)
+		}
+	default:
+		return fmt.Errorf("unknown mutation kind")
+	}
+	return nil
+}
+
+func applyMutationToArray(arr []any, index int, mut Mutation, skipMissing bool) error {
+	if index < 0 || index >= len(arr) {
+		return nil
+	}
+	existing := arr[index]
+	switch mut.Kind {
+	case MutationSet:
+		if index < len(arr) || !skipMissing {
+			arr[index] = mut.Value
+		}
+	case MutationIncrement:
+		num, ok := toFloat(existing)
+		if !ok {
+			return fmt.Errorf("value at index %d is not numeric", index)
+		}
+		arr[index] = normalizeNumber(num + mut.Delta)
+	case MutationRemove:
+		arr[index] = nil
+	default:
+		return fmt.Errorf("unknown mutation kind")
+	}
+	return nil
 }
 
 func toFloat(v any) (float64, bool) {

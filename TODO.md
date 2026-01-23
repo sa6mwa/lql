@@ -1,21 +1,23 @@
-# LQL Array Support Expansion (Recommended)
+# LQL Wildcard Support (Completed)
 
-- [ ] Define selector wildcard semantics
-  - [ ] Support `*` path segments in selectors (e.g. `/items/*/sku="ABC123"`).
-  - [ ] Support bracket sugar: `/items[]/sku="ABC123"` == `/items/*/sku="ABC123"`.
-  - [ ] Define `*`/`[]` as "any element" for arrays; empty arrays yield no match.
-  - [ ] Define behavior when `*`/`[]` appears under objects (error vs no match).
-  - [ ] Document that multiple wildcards imply nested "any" semantics.
-- [ ] Extend selector parser + evaluator
-  - [ ] Accept `*` and `[]` in shorthand selector paths.
-  - [ ] Update `valueAtPath`/matcher to traverse arrays for `*`/`[]`.
-  - [ ] Add tests for mixed arrays/objects and nested wildcards.
-- [ ] Add array mutation semantics using selector scoping
-  - [ ] Allow `-m` paths with `*`/`[]` to apply to matching elements only.
-  - [ ] Define selector scoping: selector matches element scope when mutation path contains `*`/`[]`.
-  - [ ] Missing paths inside matched elements should be skipped (no-op).
-  - [ ] Add tests for: match+mutate, skip non-matching elements, nested arrays.
-- [ ] Update docs and CLI help
-  - [ ] Add selector examples with `*` and `[]`.
-  - [ ] Add mutation examples showing selector-scoped array updates.
-  - [ ] Clarify performance notes and limitations.
+- [x] Define selector wildcard semantics
+  - [x] Support `*` path segments for object children (e.g. `/labels/*="prod"`).
+  - [x] Support `[]` path segments for array elements (e.g. `/items[]/sku="ABC123"`).
+  - [x] Support `**` for any child (object value or array element).
+  - [x] Support `...` for recursive descent (any depth).
+  - [x] Support bracket sugar: `/items[]/sku="ABC123"` == `/items/[]/sku="ABC123"`.
+  - [x] Define no-match behavior on type mismatch (e.g. `[]` under object).
+  - [x] Document that multiple wildcards imply nested "any" semantics.
+- [x] Extend selector parser + evaluator
+  - [x] Accept `*`, `[]`, `**`, and `...` in selector paths.
+  - [x] Update path traversal/matcher to support wildcard semantics.
+  - [x] Add tests for mixed arrays/objects and nested wildcards.
+- [x] Add wildcard mutation semantics
+  - [x] Allow `-m` paths with `*`, `[]`, `**`, and `...` to apply to matching elements only.
+  - [x] Define mutation scoping for wildcard segments (apply to matched nodes).
+  - [x] Missing paths inside matched elements are skipped (no-op).
+  - [x] Add tests for: match+mutate, skip non-matching elements, nested arrays.
+- [x] Update docs and CLI help
+  - [x] Add selector examples with `*`, `[]`, `**`, and `...`.
+  - [x] Add mutation examples showing wildcard updates.
+  - [x] Clarify behavior and limitations.

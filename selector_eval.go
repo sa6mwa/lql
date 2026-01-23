@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
-
-	"pkt.systems/lql/jsonpointer"
 )
 
 // Matches reports whether doc satisfies sel. A nil document never matches.
@@ -64,74 +62,89 @@ func matchEq(term *Term, doc map[string]any) bool {
 	if term == nil || term.Field == "" {
 		return false
 	}
-	value, ok := valueAtPath(doc, term.Field)
+	values, ok := valuesAtPath(doc, term.Field)
 	if !ok {
 		return false
 	}
-	current, ok := valueToString(value)
-	if !ok {
-		return false
+	for _, value := range values {
+		current, ok := valueToString(value)
+		if !ok {
+			continue
+		}
+		if current == term.Value {
+			return true
+		}
 	}
-	return current == term.Value
+	return false
 }
 
 func matchPrefix(term *Term, doc map[string]any) bool {
 	if term == nil || term.Field == "" {
 		return false
 	}
-	value, ok := valueAtPath(doc, term.Field)
+	values, ok := valuesAtPath(doc, term.Field)
 	if !ok {
 		return false
 	}
-	str, ok := valueToString(value)
-	if !ok {
-		return false
+	for _, value := range values {
+		str, ok := valueToString(value)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(str, term.Value) {
+			return true
+		}
 	}
-	return strings.HasPrefix(str, term.Value)
+	return false
 }
 
 func matchRange(term *RangeTerm, doc map[string]any) bool {
 	if term == nil || term.Field == "" {
 		return false
 	}
-	value, ok := valueAtPath(doc, term.Field)
+	values, ok := valuesAtPath(doc, term.Field)
 	if !ok {
 		return false
 	}
-	num, ok := valueToFloat(value)
-	if !ok {
-		return false
+	for _, value := range values {
+		num, ok := valueToFloat(value)
+		if !ok {
+			continue
+		}
+		if term.GTE != nil && num < *term.GTE {
+			continue
+		}
+		if term.GT != nil && num <= *term.GT {
+			continue
+		}
+		if term.LTE != nil && num > *term.LTE {
+			continue
+		}
+		if term.LT != nil && num >= *term.LT {
+			continue
+		}
+		return true
 	}
-	if term.GTE != nil && num < *term.GTE {
-		return false
-	}
-	if term.GT != nil && num <= *term.GT {
-		return false
-	}
-	if term.LTE != nil && num > *term.LTE {
-		return false
-	}
-	if term.LT != nil && num >= *term.LT {
-		return false
-	}
-	return true
+	return false
 }
 
 func matchIn(term *InTerm, doc map[string]any) bool {
 	if term == nil || term.Field == "" || len(term.Any) == 0 {
 		return false
 	}
-	value, ok := valueAtPath(doc, term.Field)
+	values, ok := valuesAtPath(doc, term.Field)
 	if !ok {
 		return false
 	}
-	str, ok := valueToString(value)
-	if !ok {
-		return false
-	}
-	for _, candidate := range term.Any {
-		if str == candidate {
-			return true
+	for _, value := range values {
+		str, ok := valueToString(value)
+		if !ok {
+			continue
+		}
+		for _, candidate := range term.Any {
+			if str == candidate {
+				return true
+			}
 		}
 	}
 	return false
@@ -141,41 +154,110 @@ func matchExists(field string, doc map[string]any) bool {
 	if field == "" {
 		return false
 	}
-	value, ok := valueAtPath(doc, field)
+	values, ok := valuesAtPath(doc, field)
 	if !ok {
 		return false
 	}
-	return value != nil
+	for _, value := range values {
+		if value != nil {
+			return true
+		}
+	}
+	return false
 }
 
-func valueAtPath(root any, field string) (any, bool) {
+func valuesAtPath(root any, field string) ([]any, bool) {
 	if field == "" {
 		return nil, false
 	}
-	segments, err := jsonpointer.Split(field)
+	segments, err := selectorPathSegments(field)
 	if err != nil || len(segments) == 0 {
 		return nil, false
 	}
-	current := root
+	nodes := []any{root}
 	for _, segment := range segments {
-		switch node := current.(type) {
-		case map[string]any:
-			val, ok := node[segment]
-			if !ok {
-				return nil, false
-			}
-			current = val
-		case []any:
-			index, err := strconv.Atoi(segment)
-			if err != nil || index < 0 || index >= len(node) {
-				return nil, false
-			}
-			current = node[index]
-		default:
+		if len(nodes) == 0 {
 			return nil, false
 		}
+		var next []any
+		for _, node := range nodes {
+			switch segment {
+			case "*":
+				if v, ok := node.(map[string]any); ok {
+					for _, child := range v {
+						next = append(next, child)
+					}
+				}
+			case "[]":
+				if arr, ok := node.([]any); ok {
+					next = append(next, arr...)
+				}
+			case "**":
+				switch v := node.(type) {
+				case map[string]any:
+					for _, child := range v {
+						next = append(next, child)
+					}
+				case []any:
+					next = append(next, v...)
+				}
+			case "...":
+				next = append(next, collectDescendants(node, true)...)
+			default:
+				switch v := node.(type) {
+				case map[string]any:
+					child, ok := v[segment]
+					if ok {
+						next = append(next, child)
+					}
+				case []any:
+					index, err := strconv.Atoi(segment)
+					if err != nil || index < 0 || index >= len(v) {
+						continue
+					}
+					next = append(next, v[index])
+				}
+			}
+		}
+		nodes = next
 	}
-	return current, true
+	if len(nodes) == 0 {
+		return nil, false
+	}
+	return nodes, true
+}
+
+func collectDescendants(node any, includeSelf bool) []any {
+	if node == nil {
+		return nil
+	}
+	var out []any
+	stack := []any{node}
+	if !includeSelf {
+		stack = stack[:0]
+		switch v := node.(type) {
+		case map[string]any:
+			for _, child := range v {
+				stack = append(stack, child)
+			}
+		case []any:
+			stack = append(stack, v...)
+		}
+	}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		out = append(out, n)
+		switch v := n.(type) {
+		case map[string]any:
+			for _, child := range v {
+				stack = append(stack, child)
+			}
+		case []any:
+			stack = append(stack, v...)
+		}
+	}
+	return out
 }
 
 func valueToString(v any) (string, bool) {

@@ -5,7 +5,7 @@ JSON documents. This module includes:
 
 - A Go library for parsing selectors and mutations, plus selector evaluation.
 - A CLI (`cmd/lql`) for selecting JSON documents, applying mutations, and
-  formatting output via prettyx.
+  formatting output via [pkt.systems/prettyx](https://pkg.go.dev/pkt.systems/prettyx).
 
 ## Install
 
@@ -50,6 +50,22 @@ Array element selection is supported via JSON Pointer indices:
 sel, _ := lql.ParseSelectorString(`/devices/0/status="online"`)
 ```
 
+Wildcard selection follows explicit semantics:
+
+- `*` matches any child value of an object (objects only; arrays do not match)
+- `[]` matches any element of an array (arrays only; objects do not match)
+- `**` matches any child (object value or array element)
+- `...` matches any descendant at any depth (objects or arrays)
+- Type mismatches do not match (e.g. `[]` on an object)
+- Bracket sugar: `/items[]/sku` is the same as `/items/[]/sku`
+
+```go
+sel, _ := lql.ParseSelectorString(`/labels/*="production"`)
+sel, _ = lql.ParseSelectorString(`/items[]/sku="ABC-123"`)
+sel, _ = lql.ParseSelectorString(`/items/**/sku="ABC-123"`)
+sel, _ = lql.ParseSelectorString(`/items/.../sku="ABC-123"`)
+```
+
 ### Mutations
 
 Mutations modify JSON objects in-place.
@@ -83,7 +99,8 @@ Time-prefixed mutations normalize timestamps to RFC3339Nano:
 _ = lql.MutateWithTime(doc, time.Now(), `time:/state/updated=NOW`)
 ```
 
-Note: mutations do not support JSON array traversal or updates.
+Mutations support the same wildcard semantics as selectors; missing paths under
+wildcards are skipped.
 
 ## CLI usage
 
@@ -130,6 +147,18 @@ Match on array elements inside each document:
 lql '/devices/0/status="online"' data.json
 ```
 
+Match on any array element using wildcards:
+
+```bash
+lql '/items[]/sku="ABC-123"' data.json
+```
+
+Match on any descendant using recursive descent:
+
+```bash
+lql '/items/.../sku="ABC-123"' data.json
+```
+
 ### Mutation examples
 
 Apply mutations conditionally:
@@ -144,7 +173,20 @@ Apply mutations and emit only selected fields:
 lql -m '/state/retries=+3' -f /state/retries -f /state/status state.json
 ```
 
-Note: mutations only work on JSON objects and do not support array traversal.
+Apply mutations across array elements:
+
+```bash
+lql -m '/items[]/status=ready' data.json
+```
+
+Apply mutations using recursive descent:
+
+```bash
+lql -m '/groups/.../status=ready' data.json
+```
+
+Note: mutations apply to a JSON object root, but paths may traverse arrays using
+wildcards or numeric indices.
 
 Write mutations inline:
 
@@ -164,6 +206,7 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 - JSON Pointer fields: `/path/to/field`
 - Shorthand: `/field=value`, `/field!=value`, `/field>=10`, `/field<5`
 - Arrays: `/items/0/sku="ABC-123"`
+- Wildcards: `*` (object values), `[]` (array elements), `**` (any child), `...` (recursive descent)
 
 ## Mutation grammar overview
 
@@ -172,3 +215,4 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 - Remove: `rm:/path`, `delete:/path`
 - Time: `time:/path=NOW` or RFC3339 timestamp
 - Brace: `/path{/a=1,/b=2}`
+- Wildcards: `*`, `[]`, `**`, `...` in path segments

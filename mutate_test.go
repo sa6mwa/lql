@@ -275,6 +275,109 @@ func TestApplyMutationsJSON(t *testing.T) {
 	}
 }
 
+func TestApplyMutationsWildcards(t *testing.T) {
+	doc := map[string]any{
+		"labels": map[string]any{
+			"env":   "prod",
+			"owner": "alice",
+		},
+		"items": []any{
+			map[string]any{"sku": "A", "price": int64(10)},
+			map[string]any{"sku": "B", "price": int64(20)},
+		},
+		"groups": []any{
+			map[string]any{
+				"items": []any{
+					map[string]any{"sku": "C"},
+				},
+			},
+		},
+	}
+	muts, err := ParseMutations([]string{
+		`/labels/*="tagged"`,
+		`/items/**/sku="X"`,
+		`/items[]/price=+5`,
+		`/items/*/price=+1`,
+		`/groups/.../sku="Z"`,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("parse mutations: %v", err)
+	}
+	if err := ApplyMutations(doc, muts); err != nil {
+		t.Fatalf("apply mutations: %v", err)
+	}
+	labels := doc["labels"].(map[string]any)
+	if labels["env"] != "tagged" || labels["owner"] != "tagged" {
+		t.Fatalf("expected labels tagged, got %+v", labels)
+	}
+	items := doc["items"].([]any)
+	item0 := items[0].(map[string]any)
+	item1 := items[1].(map[string]any)
+	if item0["sku"] != "X" || item1["sku"] != "X" {
+		t.Fatalf("expected sku X, got %v and %v", item0["sku"], item1["sku"])
+	}
+	if numberValue(t, item0["price"]) != 15 || numberValue(t, item1["price"]) != 25 {
+		t.Fatalf("expected prices 15 and 25, got %v and %v", item0["price"], item1["price"])
+	}
+	groups := doc["groups"].([]any)
+	group0 := groups[0].(map[string]any)
+	groupItems := group0["items"].([]any)
+	groupSku := groupItems[0].(map[string]any)["sku"]
+	if groupSku != "Z" {
+		t.Fatalf("expected group sku Z, got %v", groupSku)
+	}
+}
+
+func TestApplyMutationsWildcardRemove(t *testing.T) {
+	doc := map[string]any{
+		"labels": map[string]any{
+			"env":   "prod",
+			"owner": "alice",
+		},
+		"items": []any{
+			map[string]any{"sku": "A", "price": int64(10)},
+			map[string]any{"sku": "B", "price": int64(20)},
+		},
+		"nested": map[string]any{
+			"items": []any{
+				map[string]any{"sku": "C", "price": int64(30)},
+			},
+		},
+	}
+	muts, err := ParseMutations([]string{
+		`rm:/labels/*`,
+		`rm:/items[]/price`,
+		`rm:/items/**/sku`,
+		`rm:/nested/.../price`,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("parse mutations: %v", err)
+	}
+	if err := ApplyMutations(doc, muts); err != nil {
+		t.Fatalf("apply mutations: %v", err)
+	}
+	labels := doc["labels"].(map[string]any)
+	if len(labels) != 0 {
+		t.Fatalf("expected labels to be empty, got %+v", labels)
+	}
+	items := doc["items"].([]any)
+	for _, item := range items {
+		entry := item.(map[string]any)
+		if _, ok := entry["price"]; ok {
+			t.Fatalf("expected price removed, got %+v", entry)
+		}
+		if _, ok := entry["sku"]; ok {
+			t.Fatalf("expected sku removed, got %+v", entry)
+		}
+	}
+	nested := doc["nested"].(map[string]any)
+	nestedItems := nested["items"].([]any)
+	nestedItem := nestedItems[0].(map[string]any)
+	if _, ok := nestedItem["price"]; ok {
+		t.Fatalf("expected nested price removed, got %+v", nestedItem)
+	}
+}
+
 func TestParseMutationsQuotedPaths(t *testing.T) {
 	now := time.Date(2025, 10, 11, 3, 0, 0, 0, time.UTC)
 	doc := map[string]any{
