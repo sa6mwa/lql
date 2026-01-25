@@ -52,6 +52,13 @@ Shorthand forms are supported:
 sel, _ := lql.ParseSelectorString(`/status="open",/progress>=50`)
 ```
 
+If you want implicit OR semantics across a single string, use
+`ParseSelectorStringOr`:
+
+```go
+sel, _ := lql.ParseSelectorStringOr(`/status="open",/status="queued"`)
+```
+
 Array element selection is supported via JSON Pointer indices:
 
 ```go
@@ -139,6 +146,69 @@ Select documents matching a status and region:
 
 ```bash
 lql '/status="open",/region="us-west"' data.json
+```
+
+### Full LQL examples
+
+CLI (full LQL expressions):
+
+```bash
+lql 'and.eq{field=/status,value=open},and.range{field=/progress,gte=50}' data.json
+```
+
+```bash
+lql 'or.eq{field=/region,value=us},or.eq{field=/region,value=eu}' data.json
+```
+
+```bash
+lql 'not.eq{field=/state,value=disabled}' data.json
+```
+
+```bash
+lql 'exists{/metadata/etag}' data.json
+```
+
+```bash
+lql 'in{field=/env,any=prod|stage|dev}' data.json
+```
+
+```bash
+lql 'and.eq{field=/items[]/sku,value=ABC-123},and.range{field=/items[]/price,lt=20}' data.json
+```
+
+Note: full LQL expressions use `{}` and should be quoted (or the braces
+escaped) to avoid shell brace expansion.
+
+SDK (parse full LQL expressions):
+
+```go
+sel, err := lql.ParseSelectorString(
+  "and.eq{field=/status,value=open},and.range{field=/progress,gte=50}",
+)
+```
+
+```go
+sel, err := lql.ParseSelectorString(
+  "or.eq{field=/region,value=us},or.eq{field=/region,value=eu}",
+)
+```
+
+```go
+sel, err := lql.ParseSelectorString("not.eq{field=/state,value=disabled}")
+```
+
+```go
+sel, err := lql.ParseSelectorString("exists{/metadata/etag}")
+```
+
+```go
+sel, err := lql.ParseSelectorString("in{field=/env,any=prod|stage|dev}")
+```
+
+```go
+sel, err := lql.ParseSelectorString(
+  "and.eq{field=/items[]/sku,value=ABC-123},and.range{field=/items[]/price,lt=20}",
+)
 ```
 
 Select only a few fields from matching documents:

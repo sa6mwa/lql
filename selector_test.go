@@ -34,8 +34,15 @@ func TestParseSelectorValuesBrace(t *testing.T) {
 	if sel.IsEmpty() {
 		t.Fatal("expected selector")
 	}
-	if sel.Or == nil || len(sel.Or) != 3 {
+	if len(sel.Or) != 0 {
 		t.Fatalf("unexpected selector %+v", sel)
+	}
+	andClauses, orGroup := splitAndOrClausesSelectors(t, sel)
+	if len(andClauses) != 1 {
+		t.Fatalf("expected 1 and clause, got %+v", sel)
+	}
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected 2 or clauses, got %+v", sel)
 	}
 }
 
@@ -48,8 +55,15 @@ func TestParseSelectorString(t *testing.T) {
 	if sel.IsEmpty() {
 		t.Fatal("expected selector")
 	}
-	if sel.Or == nil || len(sel.Or) != 3 {
+	if len(sel.Or) != 0 {
 		t.Fatalf("unexpected selector %+v", sel)
+	}
+	andClauses, orGroup := splitAndOrClausesSelectors(t, sel)
+	if len(andClauses) != 1 {
+		t.Fatalf("expected 1 and clause, got %+v", sel)
+	}
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected 2 or clauses, got %+v", sel)
 	}
 }
 
@@ -72,6 +86,27 @@ value="hi, world"},and.eq{field=/status value="okili dokili"}`
 func TestParseSelectorStringInvalid(t *testing.T) {
 	if _, err := ParseSelectorString("and.eq{field=/status,value=open"); err == nil {
 		t.Fatal("expected parse error")
+	}
+}
+
+func TestParseSelectorStringOrClauses(t *testing.T) {
+	expr := `/field="value",/status="ok",or.eq{field=/msg,value=ok},or.eq{field=/msg,value=done}`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatalf("expected selector, got %+v", sel)
+	}
+	if len(sel.Or) != 0 {
+		t.Fatalf("expected no top-level or clauses, got %+v", sel)
+	}
+	andClauses, orGroup := splitAndOrClausesSelectors(t, sel)
+	if len(andClauses) != 2 {
+		t.Fatalf("expected 2 and clauses, got %+v", sel)
+	}
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected 2 or clauses, got %+v", sel)
 	}
 }
 
@@ -184,6 +219,183 @@ func ExampleParseSelectorStringsOr() {
 	}
 	fmt.Println(!sel.IsEmpty(), len(sel.Or))
 	// Output: true 2
+}
+
+func ExampleParseSelectorStringOr() {
+	sel, err := ParseSelectorStringOr(`/status="ok",/msg="done"`)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println(!sel.IsEmpty(), len(sel.Or))
+	// Output: true 2
+}
+
+func splitAndOrClausesSelectors(t *testing.T, sel Selector) ([]Selector, Selector) {
+	t.Helper()
+	var andClauses []Selector
+	var orGroup Selector
+	for _, clause := range sel.And {
+		if len(clause.Or) > 0 {
+			if len(orGroup.Or) > 0 {
+				t.Fatalf("multiple or groups in selector %+v", sel)
+			}
+			orGroup = clause
+			continue
+		}
+		andClauses = append(andClauses, clause)
+	}
+	return andClauses, orGroup
+}
+
+func TestParseSelectorStringOrWithCommaSeparated(t *testing.T) {
+	sel, err := ParseSelectorStringOr(`/status="ok",/status="done"`)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() || len(sel.Or) != 2 {
+		t.Fatalf("expected two or clauses, got %+v", sel)
+	}
+}
+
+func TestParseSelectorStringsOrWithCommaElement(t *testing.T) {
+	sel, err := ParseSelectorStringsOr([]string{`/status="ok",/status="done"`})
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatalf("expected selector")
+	}
+	if len(sel.Or) != 1 {
+		t.Fatalf("expected one top-level or clause, got %+v", sel)
+	}
+	if len(sel.Or[0].Or) == 2 {
+		return
+	}
+	andClauses, orGroup := splitAndOrClausesSelectors(t, sel.Or[0])
+	if len(andClauses) != 0 {
+		t.Fatalf("expected no and clauses, got %+v", andClauses)
+	}
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected two or clauses, got %+v", orGroup)
+	}
+}
+
+func TestParseSelectorStringOrIgnoresEmptyTokens(t *testing.T) {
+	sel, err := ParseSelectorStringOr(` ,  /status="ok" ,  `)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatalf("expected selector")
+	}
+	if sel.Eq == nil || sel.Eq.Field != "/status" || sel.Eq.Value != "ok" {
+		t.Fatalf("unexpected selector %+v", sel)
+	}
+}
+
+func TestParseSelectorStringOrExplicitAndPreserved(t *testing.T) {
+	expr := `and.eq{field=/status,value=ok},/msg="done"`
+	sel, err := ParseSelectorStringOr(expr)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatalf("expected selector")
+	}
+	andClauses, orGroup := splitAndOrClausesSelectors(t, sel)
+	if len(andClauses) != 1 {
+		t.Fatalf("expected 1 and clause, got %+v", andClauses)
+	}
+	if len(orGroup.Or) != 1 {
+		t.Fatalf("expected 1 or clause, got %+v", orGroup)
+	}
+}
+
+func TestParseSelectorStringImplicitAndConflicts(t *testing.T) {
+	expr := `/status="ok",/status="done"`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	andClauses, _ := splitAndOrClausesSelectors(t, sel)
+	if len(andClauses) != 2 {
+		t.Fatalf("expected 2 and clauses, got %+v", andClauses)
+	}
+}
+
+func TestParseSelectorStringExplicitAndIndexMerges(t *testing.T) {
+	expr := `and.0.eq{field=/status,value=ok},and.0.range{field=/progress,gte=10}`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	andClauses, _ := splitAndOrClausesSelectors(t, sel)
+	if len(andClauses) != 1 {
+		t.Fatalf("expected 1 and clause, got %+v", andClauses)
+	}
+	clause := andClauses[0]
+	if clause.Eq == nil || clause.Eq.Field != "/status" || clause.Eq.Value != "ok" {
+		t.Fatalf("unexpected eq clause %+v", clause)
+	}
+	if clause.Range == nil || clause.Range.Field != "/progress" || clause.Range.GTE == nil || *clause.Range.GTE != 10 {
+		t.Fatalf("unexpected range clause %+v", clause)
+	}
+}
+
+func TestParseSelectorStringExplicitOrIndexMerges(t *testing.T) {
+	expr := `or.0.eq{field=/status,value=ok},or.0.range{field=/progress,gte=10}`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if len(sel.Or) != 1 {
+		t.Fatalf("expected 1 top-level or clause, got %+v", sel)
+	}
+	clause := sel.Or[0]
+	if clause.Eq == nil || clause.Eq.Field != "/status" || clause.Eq.Value != "ok" {
+		t.Fatalf("unexpected eq clause %+v", clause)
+	}
+	if clause.Range == nil || clause.Range.Field != "/progress" || clause.Range.GTE == nil || *clause.Range.GTE != 10 {
+		t.Fatalf("unexpected range clause %+v", clause)
+	}
+}
+
+func TestParseSelectorStringExplicitOrIndexConflict(t *testing.T) {
+	expr := `or.0.eq{field=/status,value=ok},or.0.eq{field=/status,value=done}`
+	if _, err := ParseSelectorString(expr); err == nil {
+		t.Fatal("expected parse conflict for duplicate or index")
+	}
+}
+
+func TestParseSelectorStringExplicitAndIndexConflict(t *testing.T) {
+	expr := `and.0.eq{field=/status,value=ok},and.0.eq{field=/status,value=done}`
+	if _, err := ParseSelectorString(expr); err == nil {
+		t.Fatal("expected parse conflict for duplicate and index")
+	}
+}
+
+func TestParseSelectorStringsAndIgnoresEmpty(t *testing.T) {
+	sel, err := ParseSelectorStrings([]string{"", "   ", `/status="ok"`})
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() || len(sel.And) != 1 {
+		t.Fatalf("expected one and clause, got %+v", sel)
+	}
+}
+
+func TestParseSelectorStringsOrNestedAndClause(t *testing.T) {
+	sel, err := ParseSelectorStringsOr([]string{`/status="ok",/msg="done"`})
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() || len(sel.Or) != 1 {
+		t.Fatalf("expected one or clause, got %+v", sel)
+	}
+	if len(sel.Or[0].And) != 0 || len(sel.Or[0].Or) != 2 {
+		t.Fatalf("expected nested or clauses, got %+v", sel.Or[0])
+	}
 }
 
 func TestParseSelectorShorthand(t *testing.T) {

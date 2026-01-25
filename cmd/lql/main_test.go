@@ -45,6 +45,34 @@ func TestBuildSelectorOR(t *testing.T) {
 	}
 }
 
+func TestBuildSelectorAndOrMix(t *testing.T) {
+	args := []string{
+		`/status=404`,
+		`/lvl="warn"`,
+		`or.eq{field=/domain,value=pkt.systems},or.eq{field=/domain,value=qzj.se}`,
+	}
+	sel, err := buildSelector(args, false)
+	if err != nil {
+		t.Fatalf("buildSelector: %v", err)
+	}
+	matchPkt := map[string]any{"status": 404, "lvl": "warn", "domain": "pkt.systems"}
+	if !lql.Matches(sel, matchPkt) {
+		t.Fatalf("expected selector to match pkt.systems")
+	}
+	matchQzj := map[string]any{"status": 404, "lvl": "warn", "domain": "qzj.se"}
+	if !lql.Matches(sel, matchQzj) {
+		t.Fatalf("expected selector to match qzj.se")
+	}
+	noMatchDomain := map[string]any{"status": 404, "lvl": "warn", "domain": "alltsomkod.se"}
+	if lql.Matches(sel, noMatchDomain) {
+		t.Fatalf("expected selector to reject other domains")
+	}
+	noMatchStatus := map[string]any{"status": 500, "lvl": "warn", "domain": "pkt.systems"}
+	if lql.Matches(sel, noMatchStatus) {
+		t.Fatalf("expected selector to reject wrong status")
+	}
+}
+
 func TestEmitSelectionStreamWildcards(t *testing.T) {
 	selector, err := buildSelector([]string{`/items[]/sku="B"`}, false)
 	if err != nil {
@@ -484,9 +512,9 @@ func TestRunMutationsMatchesOnly(t *testing.T) {
 	}
 
 	cfg := config{
-		mutations: stringList{`/hello=world`},
+		mutations:   stringList{`/hello=world`},
 		matchesOnly: true,
-		compact:   true,
+		compact:     true,
 	}
 	selector, err := buildSelector([]string{`/status=404`}, false)
 	if err != nil {

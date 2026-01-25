@@ -41,7 +41,18 @@ func ParseSelectorValues(values url.Values) (Selector, error) {
 }
 
 // ParseSelectorString parses a comma/newline separated selector expression string (LQL).
+// When multiple expressions are provided, non-explicit clauses are combined with AND.
 func ParseSelectorString(expr string) (Selector, error) {
+	return parseSelectorString(expr, false)
+}
+
+// ParseSelectorStringOr parses a comma/newline separated selector expression string (LQL).
+// When multiple expressions are provided, non-explicit clauses are combined with OR.
+func ParseSelectorStringOr(expr string) (Selector, error) {
+	return parseSelectorString(expr, true)
+}
+
+func parseSelectorString(expr string, orMode bool) (Selector, error) {
 	tokens, err := splitExpressions(expr)
 	if err != nil {
 		return Selector{}, err
@@ -49,17 +60,34 @@ func ParseSelectorString(expr string) (Selector, error) {
 	if len(tokens) == 0 {
 		return Selector{}, nil
 	}
+	implicitAnd := len(tokens) > 1 && !orMode
+	implicitOr := len(tokens) > 1 && orMode
 	values := url.Values{}
 	for _, token := range tokens {
 		rewritten, ok, err := rewriteShorthandExpression(token)
 		if err != nil {
 			return Selector{}, err
 		}
+		key := token
 		if ok {
-			values.Add(rewritten, "")
+			key = rewritten
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
 			continue
 		}
-		values.Add(token, "")
+		first := firstSelectorToken(key)
+		if implicitAnd {
+			if first != "" && first != "and" && first != "or" {
+				key = "and." + key
+			}
+		}
+		if implicitOr {
+			if first != "" && first != "and" && first != "or" {
+				key = "or." + key
+			}
+		}
+		values.Add(key, "")
 	}
 	return ParseSelectorValues(values)
 }
@@ -81,7 +109,13 @@ func parseSelectorStrings(exprs []string, orMode bool) (Selector, error) {
 		if expr == "" {
 			continue
 		}
-		sel, err := ParseSelectorString(expr)
+		var sel Selector
+		var err error
+		if orMode {
+			sel, err = ParseSelectorStringOr(expr)
+		} else {
+			sel, err = ParseSelectorString(expr)
+		}
 		if err != nil {
 			return Selector{}, err
 		}
@@ -302,12 +336,21 @@ func parseSelectorKey(key string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("selector %q missing closing brace", key)
 		}
 		content := raw[start+1 : len(raw)-1]
-		assignments, err := parseInlineAssignments(content)
+		raw = strings.TrimSpace(raw[:start])
+		tokens := splitTokens(raw)
+		if len(tokens) == 0 {
+			return nil, nil, fmt.Errorf("selector path %q empty", key)
+		}
+		allowBare := len(tokens) > 0 && tokens[0] == "exists"
+		if !allowBare && len(tokens) > 1 && (tokens[0] == "or" || tokens[0] == "and") && tokens[1] == "exists" {
+			allowBare = true
+		}
+		assignments, err := parseInlineAssignments(content, allowBare)
 		if err != nil {
 			return nil, nil, err
 		}
 		inline = assignments
-		raw = strings.TrimSpace(raw[:start])
+		return tokens, inline, nil
 	}
 	tokens := splitTokens(raw)
 	if len(tokens) == 0 {
@@ -389,8 +432,8 @@ func splitExpressions(input string) ([]string, error) {
 	return cleaned, nil
 }
 
-func parseInlineAssignments(raw string) (map[string]string, error) {
-	tokens, err := splitAssignmentTokens(raw)
+func parseInlineAssignments(raw string, allowBare bool) (map[string]string, error) {
+	tokens, err := splitAssignmentTokens(raw, allowBare)
 	if err != nil {
 		return nil, err
 	}
@@ -398,6 +441,13 @@ func parseInlineAssignments(raw string) (map[string]string, error) {
 	for _, token := range tokens {
 		parts := strings.SplitN(token, "=", 2)
 		if len(parts) != 2 {
+			if allowBare {
+				if _, exists := assignments[""]; exists {
+					return nil, fmt.Errorf("invalid selector expression %q", token)
+				}
+				assignments[""] = strings.TrimSpace(token)
+				continue
+			}
 			return nil, fmt.Errorf("invalid selector expression %q", token)
 		}
 		key := strings.TrimSpace(parts[0])
@@ -416,7 +466,7 @@ func parseInlineAssignments(raw string) (map[string]string, error) {
 	return assignments, nil
 }
 
-func splitAssignmentTokens(input string) ([]string, error) {
+func splitAssignmentTokens(input string, allowBare bool) ([]string, error) {
 	var tokens []string
 	var chunk strings.Builder
 	inQuotes := false
@@ -428,6 +478,16 @@ func splitAssignmentTokens(input string) ([]string, error) {
 			return nil
 		}
 		if !seenEqual {
+			if allowBare {
+				token := strings.TrimSpace(chunk.String())
+				if token != "" {
+					tokens = append(tokens, token)
+				}
+				chunk.Reset()
+				seenEqual = false
+				valueStarted = false
+				return nil
+			}
 			return fmt.Errorf("invalid selector expression %q", chunk.String())
 		}
 		token := strings.TrimSpace(chunk.String())
@@ -486,11 +546,9 @@ func splitAssignmentTokens(input string) ([]string, error) {
 
 // selectorBuilder routes assignments to the base clause or dedicated OR clauses.
 type selectorBuilder struct {
-	base        *clauseBuilder
-	orClauses   []*clauseBuilder
-	orKeyed     map[string]*clauseBuilder
-	activeOrKey string
-	activeOr    *clauseBuilder
+	base      *clauseBuilder
+	orClauses []*clauseBuilder
+	orKeyed   map[string]*clauseBuilder
 }
 
 func newSelectorBuilder() *selectorBuilder {
@@ -517,8 +575,25 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 			defer clause.endSticky()
 		}
 		for _, field := range keys {
+			if len(clauseTokens) > 0 && clauseTokens[0] == "exists" && field == "" {
+				if len(keys) != 1 {
+					return fmt.Errorf("exists selector accepts a single value")
+				}
+				if err := clause.assign(clauseTokens, fields[field]); err != nil {
+					return err
+				}
+				continue
+			}
 			path := append(clauseTokens, field)
-			if err := clause.assign(path, convertSelectorValue(fields[field])); err != nil {
+			value := convertSelectorValue(fields[field])
+			if len(clauseTokens) > 0 && clauseTokens[0] == "in" && field == "any" {
+				any, err := parseInAny(fields[field])
+				if err != nil {
+					return err
+				}
+				value = any
+			}
+			if err := clause.assign(path, value); err != nil {
 				return err
 			}
 		}
@@ -529,8 +604,25 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 		defer b.base.endSticky()
 	}
 	for _, field := range keys {
+		if len(tokens) > 0 && tokens[0] == "exists" && field == "" {
+			if len(keys) != 1 {
+				return fmt.Errorf("exists selector accepts a single value")
+			}
+			if err := b.base.assign(tokens, fields[field]); err != nil {
+				return err
+			}
+			continue
+		}
 		path := append(tokens, field)
-		if err := b.base.assign(path, convertSelectorValue(fields[field])); err != nil {
+		value := convertSelectorValue(fields[field])
+		if len(tokens) > 0 && tokens[0] == "in" && field == "any" {
+			any, err := parseInAny(fields[field])
+			if err != nil {
+				return err
+			}
+			value = any
+		}
+		if err := b.base.assign(path, value); err != nil {
 			return err
 		}
 	}
@@ -551,8 +643,6 @@ func (b *selectorBuilder) assign(tokens []string, tail []string, rawValue string
 		clause := b.orClauseFor(clauseKey)
 		return clause.assign(clauseTokens, value)
 	}
-	b.activeOr = nil
-	b.activeOrKey = ""
 	return b.base.assign(fullPath, value)
 }
 
@@ -576,36 +666,44 @@ func (b *selectorBuilder) orClauseFor(key string) *clauseBuilder {
 		b.orClauses = append(b.orClauses, clause)
 		return clause
 	}
-	if b.activeOr != nil && b.activeOrKey == key {
-		return b.activeOr
-	}
 	clause := newClauseBuilder()
 	b.orClauses = append(b.orClauses, clause)
-	b.activeOr = clause
-	b.activeOrKey = key
 	return clause
 }
 
 func (b *selectorBuilder) build() (Selector, bool, error) {
-	nodes := make([]any, 0, len(b.orClauses)+1)
-	if !isEmptyMap(b.base.root) {
-		nodes = append(nodes, b.base.root)
+	baseSel, baseOK, err := selectorFromClause(b.base)
+	if err != nil {
+		return Selector{}, false, err
 	}
+	orSels := make([]Selector, 0, len(b.orClauses))
 	for _, clause := range b.orClauses {
-		if !isEmptyMap(clause.root) {
-			nodes = append(nodes, clause.root)
+		sel, ok, err := selectorFromClause(clause)
+		if err != nil {
+			return Selector{}, false, err
+		}
+		if ok {
+			orSels = append(orSels, sel)
 		}
 	}
-	var payload []byte
-	var err error
-	switch len(nodes) {
-	case 0:
-		payload, err = json.Marshal(b.base.root)
-	case 1:
-		payload, err = json.Marshal(nodes[0])
-	default:
-		payload, err = json.Marshal(map[string]any{"or": nodes})
+	if !baseOK && len(orSels) == 0 {
+		return Selector{}, false, nil
 	}
+	if !baseOK {
+		return Selector{Or: orSels}, true, nil
+	}
+	if len(orSels) == 0 {
+		return baseSel, true, nil
+	}
+	baseSel.And = append(baseSel.And, Selector{Or: orSels})
+	return baseSel, true, nil
+}
+
+func selectorFromClause(clause *clauseBuilder) (Selector, bool, error) {
+	if clause == nil || isEmptyMap(clause.root) {
+		return Selector{}, false, nil
+	}
+	payload, err := json.Marshal(clause.root)
 	if err != nil {
 		return Selector{}, false, err
 	}
@@ -825,6 +923,29 @@ func convertSelectorValue(v string) any {
 		return false
 	}
 	return trimmed
+}
+
+func parseInAny(raw string) ([]string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil, fmt.Errorf("in.any requires values")
+	}
+	if unquoted, ok := stripQuotes(value); ok {
+		value = unquoted
+	}
+	parts := strings.Split(value, "|")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("in.any requires values")
+	}
+	return out, nil
 }
 
 func stripQuotes(v string) (string, bool) {

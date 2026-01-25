@@ -212,7 +212,7 @@ func TestParseInlineAssignmentsNewlines(t *testing.T) {
   owner = "alice"
   note = "hi, world"
 `
-	fields, err := parseInlineAssignments(input)
+	fields, err := parseInlineAssignments(input, false)
 	if err != nil {
 		t.Fatalf("parseInlineAssignments: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestParseInlineAssignmentsNewlines(t *testing.T) {
 }
 
 func TestParseInlineAssignmentsQuotedKeys(t *testing.T) {
-	fields, err := parseInlineAssignments(`"hello key"="value,1",other=two`)
+	fields, err := parseInlineAssignments(`"hello key"="value,1",other=two`, false)
 	if err != nil {
 		t.Fatalf("parseInlineAssignments: %v", err)
 	}
@@ -454,14 +454,14 @@ or.1.eq{field=/transaction/counterparty/country,value=NO}`
 	if sel.IsEmpty() {
 		t.Fatalf("expected selector")
 	}
-	if len(sel.Or) != 3 {
-		t.Fatalf("expected or clauses with base selector, got %+v", sel)
+	andClauses, orGroup := splitAndOrClauses(t, sel)
+	if len(andClauses) != 2 {
+		t.Fatalf("expected base and clauses, got %+v", andClauses)
 	}
-	base := sel.Or[0]
-	if len(base.And) != 2 {
-		t.Fatalf("expected base and clauses, got %+v", base)
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected 2 or clauses, got %+v", orGroup)
 	}
-	clauses := selectorClausesByField(t, base.And)
+	clauses := selectorClausesByField(t, andClauses)
 	if eq := clauses["/transaction/status"]; eq.Eq == nil || eq.Eq.Value != "pending" {
 		t.Fatalf("unexpected status clause %+v", eq)
 	}
@@ -469,7 +469,7 @@ or.1.eq{field=/transaction/counterparty/country,value=NO}`
 		t.Fatalf("unexpected range clause %+v", rng)
 	}
 	seen := make(map[string]bool)
-	for _, clause := range sel.Or[1:] {
+	for _, clause := range orGroup.Or {
 		if clause.Eq == nil || clause.Eq.Field != "/transaction/counterparty/country" {
 			t.Fatalf("unexpected or clause %+v", clause)
 		}
@@ -527,14 +527,14 @@ or.1.eq{field=/voucher/lines/10/dimensions/cost_center,value=AMS}`
 	if sel.IsEmpty() {
 		t.Fatalf("expected selector")
 	}
-	if len(sel.Or) != 3 {
-		t.Fatalf("expected 3 or nodes, got %+v", sel)
+	andClauses, orGroup := splitAndOrClauses(t, sel)
+	if len(andClauses) != 4 {
+		t.Fatalf("expected 4 and terms, got %+v", andClauses)
 	}
-	base := sel.Or[0]
-	if len(base.And) != 4 {
-		t.Fatalf("expected 4 and terms, got %+v", base)
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected 2 or terms, got %+v", orGroup)
 	}
-	clauses := selectorClausesByField(t, base.And)
+	clauses := selectorClausesByField(t, andClauses)
 	for _, field := range []string{"/voucher/book", "/voucher/header/currency", "/voucher/header/period"} {
 		clause, ok := clauses[field]
 		if !ok || clause.Eq == nil {
@@ -548,7 +548,7 @@ or.1.eq{field=/voucher/lines/10/dimensions/cost_center,value=AMS}`
 		t.Fatalf("unexpected range term %+v", rng)
 	}
 	regions := make(map[string]bool)
-	for _, clause := range sel.Or[1:] {
+	for _, clause := range orGroup.Or {
 		if clause.Eq == nil || clause.Eq.Field != "/voucher/lines/10/dimensions/cost_center" {
 			t.Fatalf("unexpected region clause %+v", clause)
 		}
@@ -613,14 +613,14 @@ or.1.eq{field=/device/location/region,value=ap-south}`
 	if sel.IsEmpty() {
 		t.Fatalf("expected selector")
 	}
-	if len(sel.Or) != 3 {
-		t.Fatalf("expected 3 or nodes, got %+v", sel)
+	andClauses, orGroup := splitAndOrClauses(t, sel)
+	if len(andClauses) != 4 {
+		t.Fatalf("expected four and clauses, got %+v", andClauses)
 	}
-	base := sel.Or[0]
-	if len(base.And) != 4 {
-		t.Fatalf("expected four and clauses, got %+v", base)
+	if len(orGroup.Or) != 2 {
+		t.Fatalf("expected 2 or clauses, got %+v", orGroup)
 	}
-	clauses := selectorClausesByField(t, base.And)
+	clauses := selectorClausesByField(t, andClauses)
 	for _, field := range []string{"/device/firmware/channel", "/device/fleet"} {
 		clause, ok := clauses[field]
 		if !ok || clause.Eq == nil {
@@ -634,7 +634,7 @@ or.1.eq{field=/device/location/region,value=ap-south}`
 		t.Fatalf("unexpected telemetry range %+v", rng)
 	}
 	expectedRegions := map[string]bool{"us-west": false, "ap-south": false}
-	for _, clause := range sel.Or[1:] {
+	for _, clause := range orGroup.Or {
 		if clause.Eq == nil || clause.Eq.Field != "/device/location/region" {
 			t.Fatalf("unexpected region clause %+v", clause)
 		}
@@ -782,6 +782,23 @@ func selectorClausesByField(t *testing.T, clauses []Selector) map[string]Selecto
 		}
 	}
 	return result
+}
+
+func splitAndOrClauses(t *testing.T, sel Selector) ([]Selector, Selector) {
+	t.Helper()
+	var andClauses []Selector
+	var orGroup Selector
+	for _, clause := range sel.And {
+		if len(clause.Or) > 0 {
+			if len(orGroup.Or) > 0 {
+				t.Fatalf("multiple or groups in selector %+v", sel)
+			}
+			orGroup = clause
+			continue
+		}
+		andClauses = append(andClauses, clause)
+	}
+	return andClauses, orGroup
 }
 
 func assertMutation(t *testing.T, mut Mutation, kind MutationKind, path []string) {
