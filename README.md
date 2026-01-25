@@ -179,6 +179,9 @@ lql 'and.eq{field=/items[]/sku,value=ABC-123},and.range{field=/items[]/price,lt=
 Note: full LQL expressions use `{}` and should be quoted (or the braces
 escaped) to avoid shell brace expansion.
 
+Note: inside `{}`, you can use `f=`/`v=` as aliases for `field=`/`value=`, and
+`a=` as an alias for `any=` (in `in{...}` terms).
+
 SDK (parse full LQL expressions):
 
 ```go

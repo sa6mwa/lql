@@ -456,6 +456,49 @@ func TestParseSelectorShorthand(t *testing.T) {
 	})
 }
 
+func TestParseSelectorInlineAliases(t *testing.T) {
+	expr := `eq{f=/status,v=ok},in{f=/env,a=prod|stage}`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatalf("expected selector")
+	}
+	andClauses, orGroup := splitAndOrClausesSelectors(t, sel)
+	if len(orGroup.Or) != 0 {
+		t.Fatalf("expected no or clauses, got %+v", sel)
+	}
+	if len(andClauses) != 2 {
+		t.Fatalf("expected 2 and clauses, got %+v", andClauses)
+	}
+}
+
+func TestParseSelectorInAnyAliases(t *testing.T) {
+	expr := `in{f=/env,a=prod|stage|dev}`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.In == nil || len(sel.In.Any) != 3 {
+		t.Fatalf("expected in.any with 3 entries, got %+v", sel)
+	}
+}
+
+func TestParseSelectorInAnyEmpty(t *testing.T) {
+	expr := `in{field=/env,any=}`
+	if _, err := ParseSelectorString(expr); err == nil {
+		t.Fatal("expected parse error for empty in.any")
+	}
+}
+
+func TestParseSelectorInAnyWhitespace(t *testing.T) {
+	expr := `in{field=/env,any= prod | stage }`
+	if _, err := ParseSelectorString(expr); err == nil {
+		t.Fatal("expected parse error for whitespace-separated any values")
+	}
+}
+
 func TestParseSelectorStringRegression(t *testing.T) {
 	inputs := map[string]string{
 		"NegativeIndex":  "And.-1",

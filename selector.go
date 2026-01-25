@@ -450,7 +450,7 @@ func parseInlineAssignments(raw string, allowBare bool) (map[string]string, erro
 			}
 			return nil, fmt.Errorf("invalid selector expression %q", token)
 		}
-		key := strings.TrimSpace(parts[0])
+		key := normalizeSelectorKey(strings.TrimSpace(parts[0]))
 		if unquoted, ok := stripQuotes(key); ok {
 			key = unquoted
 		}
@@ -458,6 +458,9 @@ func parseInlineAssignments(raw string, allowBare bool) (map[string]string, erro
 			return nil, fmt.Errorf("selector expression %q missing key", token)
 		}
 		value := strings.TrimSpace(parts[1])
+		if existing, ok := assignments[key]; ok && existing != value {
+			return nil, fmt.Errorf("selector expression %q has duplicate key %q", token, key)
+		}
 		assignments[key] = value
 	}
 	if len(assignments) == 0 {
@@ -574,8 +577,9 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 			clause.beginSticky(sticky)
 			defer clause.endSticky()
 		}
+		term := firstToken(clauseTokens)
 		for _, field := range keys {
-			if len(clauseTokens) > 0 && clauseTokens[0] == "exists" && field == "" {
+			if term == "exists" && field == "" {
 				if len(keys) != 1 {
 					return fmt.Errorf("exists selector accepts a single value")
 				}
@@ -586,7 +590,7 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 			}
 			path := append(clauseTokens, field)
 			value := convertSelectorValue(fields[field])
-			if len(clauseTokens) > 0 && clauseTokens[0] == "in" && field == "any" {
+			if term == "in" && field == "any" {
 				any, err := parseInAny(fields[field])
 				if err != nil {
 					return err
@@ -603,8 +607,9 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 		b.base.beginSticky(sticky)
 		defer b.base.endSticky()
 	}
+	term := firstToken(tokens)
 	for _, field := range keys {
-		if len(tokens) > 0 && tokens[0] == "exists" && field == "" {
+		if term == "exists" && field == "" {
 			if len(keys) != 1 {
 				return fmt.Errorf("exists selector accepts a single value")
 			}
@@ -615,7 +620,7 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 		}
 		path := append(tokens, field)
 		value := convertSelectorValue(fields[field])
-		if len(tokens) > 0 && tokens[0] == "in" && field == "any" {
+		if term == "in" && field == "any" {
 			any, err := parseInAny(fields[field])
 			if err != nil {
 				return err
@@ -946,6 +951,33 @@ func parseInAny(raw string) ([]string, error) {
 		return nil, fmt.Errorf("in.any requires values")
 	}
 	return out, nil
+}
+
+func normalizeSelectorKey(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "f":
+		return "field"
+	case "v":
+		return "value"
+	case "a":
+		return "any"
+	default:
+		return key
+	}
+}
+
+func firstToken(tokens []string) string {
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		lower := strings.ToLower(token)
+		if lower == "and" || lower == "or" {
+			continue
+		}
+		return lower
+	}
+	return ""
 }
 
 func stripQuotes(v string) (string, bool) {

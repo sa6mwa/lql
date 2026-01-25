@@ -393,6 +393,59 @@ func TestMatchesInOrString(t *testing.T) {
 	}
 }
 
+func TestMatchesInlineAliases(t *testing.T) {
+	expr := `eq{f=/status,v=ok},in{f=/env,a=prod|stage}`
+	sel, err := ParseSelectorString(expr)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatal("expected selector")
+	}
+	if !Matches(sel, map[string]any{"status": "ok", "env": "prod"}) {
+		t.Fatal("expected selector to match")
+	}
+	if Matches(sel, map[string]any{"status": "ok", "env": "dev"}) {
+		t.Fatal("expected selector to reject env")
+	}
+}
+
+func TestMatchesInAny(t *testing.T) {
+	sel, err := ParseSelectorString(`in{field=/env,any=prod|stage|dev}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatal("expected selector")
+	}
+	if !Matches(sel, map[string]any{"env": "stage"}) {
+		t.Fatal("expected selector to match stage")
+	}
+	if Matches(sel, map[string]any{"env": "devops"}) {
+		t.Fatal("expected selector to reject non-member")
+	}
+}
+
+func TestMatchesInAnyWithOrString(t *testing.T) {
+	expr := `in{field=/env,any=prod|stage},/status="ok"`
+	sel, err := ParseSelectorStringOr(expr)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatal("expected selector")
+	}
+	if !Matches(sel, map[string]any{"env": "prod"}) {
+		t.Fatal("expected selector to match env")
+	}
+	if !Matches(sel, map[string]any{"status": "ok"}) {
+		t.Fatal("expected selector to match status")
+	}
+	if Matches(sel, map[string]any{"env": "dev"}) {
+		t.Fatal("expected selector to reject")
+	}
+}
+
 func TestMatchesShorthandAndOrClauses(t *testing.T) {
 	expr := `/field="value",/status="ok",or.eq{field=/msg,value=done},or.eq{field=/msg,value=complete}`
 	sel, err := ParseSelectorString(expr)
