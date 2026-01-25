@@ -176,6 +176,44 @@ func TestMatchExistsWildcard(t *testing.T) {
 	}
 }
 
+func TestMatchesSelectorStringsAndSlice(t *testing.T) {
+	sel, err := ParseSelectorStrings([]string{`/status="ok"`, `/msg="done"`})
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatal("expected selector")
+	}
+	if Matches(sel, map[string]any{"status": "ok", "msg": "done"}) == false {
+		t.Fatal("expected selector to match")
+	}
+	if Matches(sel, map[string]any{"status": "ok", "msg": "nope"}) {
+		t.Fatal("expected selector to reject mismatched msg")
+	}
+	if Matches(sel, map[string]any{"status": "nope", "msg": "done"}) {
+		t.Fatal("expected selector to reject mismatched status")
+	}
+}
+
+func TestMatchesSelectorStringsOrSlice(t *testing.T) {
+	sel, err := ParseSelectorStringsOr([]string{`/status="ok"`, `/msg="done"`})
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	if sel.IsEmpty() {
+		t.Fatal("expected selector")
+	}
+	if !Matches(sel, map[string]any{"status": "ok", "msg": "nope"}) {
+		t.Fatal("expected selector to match status")
+	}
+	if !Matches(sel, map[string]any{"status": "nope", "msg": "done"}) {
+		t.Fatal("expected selector to match msg")
+	}
+	if Matches(sel, map[string]any{"status": "nope", "msg": "nope"}) {
+		t.Fatal("expected selector to reject with no matches")
+	}
+}
+
 func mustParseSelector(t *testing.T, expr string) Selector {
 	t.Helper()
 	sel, err := ParseSelectorString(expr)

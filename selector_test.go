@@ -1,6 +1,7 @@
 package lql
 
 import (
+	"fmt"
 	"net/url"
 	"testing"
 )
@@ -103,6 +104,86 @@ func TestParseSelectorBooleanValue(t *testing.T) {
 	if len(expected) != 0 {
 		t.Fatalf("missing clauses for %v", expected)
 	}
+}
+
+func TestParseSelectorStringsAndSlice(t *testing.T) {
+	sel, err := ParseSelectorStrings([]string{`/status="ok"`, `/msg="done"`})
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() || len(sel.And) != 2 {
+		t.Fatalf("expected two and clauses, got %+v", sel)
+	}
+	expected := map[string]string{
+		"/status": "ok",
+		"/msg":    "done",
+	}
+	for _, clause := range sel.And {
+		if clause.Eq == nil {
+			t.Fatalf("missing eq clause: %+v", clause)
+		}
+		got, ok := expected[clause.Eq.Field]
+		if !ok {
+			t.Fatalf("unexpected field %q", clause.Eq.Field)
+		}
+		if clause.Eq.Value != got {
+			t.Fatalf("field %q expected %q got %q", clause.Eq.Field, got, clause.Eq.Value)
+		}
+		delete(expected, clause.Eq.Field)
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing clauses for %v", expected)
+	}
+}
+
+func TestParseSelectorStringsOrSlice(t *testing.T) {
+	sel, err := ParseSelectorStringsOr([]string{`/status="ok"`, `/msg="done"`})
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if sel.IsEmpty() || len(sel.Or) != 2 {
+		t.Fatalf("expected two or clauses, got %+v", sel)
+	}
+	expected := map[string]string{
+		"/status": "ok",
+		"/msg":    "done",
+	}
+	for _, clause := range sel.Or {
+		if clause.Eq == nil {
+			t.Fatalf("missing eq clause: %+v", clause)
+		}
+		got, ok := expected[clause.Eq.Field]
+		if !ok {
+			t.Fatalf("unexpected field %q", clause.Eq.Field)
+		}
+		if clause.Eq.Value != got {
+			t.Fatalf("field %q expected %q got %q", clause.Eq.Field, got, clause.Eq.Value)
+		}
+		delete(expected, clause.Eq.Field)
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing clauses for %v", expected)
+	}
+}
+
+func ExampleParseSelectorStrings() {
+	sel, err := ParseSelectorStrings([]string{`/status="ok"`, `/msg="done"`})
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println(!sel.IsEmpty(), len(sel.And))
+	// Output: true 2
+}
+
+func ExampleParseSelectorStringsOr() {
+	sel, err := ParseSelectorStringsOr([]string{`/status="ok"`, `/msg="done"`})
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println(!sel.IsEmpty(), len(sel.Or))
+	// Output: true 2
 }
 
 func TestParseSelectorShorthand(t *testing.T) {

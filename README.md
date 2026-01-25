@@ -38,6 +38,14 @@ if lql.Matches(sel, doc) {
 }
 ```
 
+If you already have selectors split into a slice, you can combine them with AND
+or OR without rejoining them yourself:
+
+```go
+sel, err := lql.ParseSelectorStrings([]string{`/status="ok"`, `/msg="done"`})
+sel, err := lql.ParseSelectorStringsOr([]string{`/status="ok"`, `/msg="done"`})
+```
+
 Shorthand forms are supported:
 
 ```go

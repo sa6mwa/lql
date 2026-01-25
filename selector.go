@@ -64,6 +64,42 @@ func ParseSelectorString(expr string) (Selector, error) {
 	return ParseSelectorValues(values)
 }
 
+// ParseSelectorStrings parses each selector expression and combines them with AND.
+func ParseSelectorStrings(exprs []string) (Selector, error) {
+	return parseSelectorStrings(exprs, false)
+}
+
+// ParseSelectorStringsOr parses each selector expression and combines them with OR.
+func ParseSelectorStringsOr(exprs []string) (Selector, error) {
+	return parseSelectorStrings(exprs, true)
+}
+
+func parseSelectorStrings(exprs []string, orMode bool) (Selector, error) {
+	var out Selector
+	for _, raw := range exprs {
+		expr := strings.TrimSpace(raw)
+		if expr == "" {
+			continue
+		}
+		sel, err := ParseSelectorString(expr)
+		if err != nil {
+			return Selector{}, err
+		}
+		if sel.IsEmpty() {
+			continue
+		}
+		if orMode {
+			out.Or = append(out.Or, sel)
+		} else {
+			out.And = append(out.And, sel)
+		}
+	}
+	if len(out.And) == 0 && len(out.Or) == 0 {
+		return Selector{}, nil
+	}
+	return out, nil
+}
+
 func rewriteShorthandExpression(expr string) (string, bool, error) {
 	trimmed := strings.TrimSpace(expr)
 	if trimmed == "" {
