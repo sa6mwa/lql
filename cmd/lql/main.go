@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/pflag"
 	"pkt.systems/lql"
 	"pkt.systems/lql/jsonpointer"
 	"pkt.systems/prettyx"
@@ -30,12 +30,17 @@ func (s *stringList) Set(value string) error {
 	return nil
 }
 
+func (s *stringList) Type() string {
+	return "string"
+}
+
 type config struct {
 	mutations stringList
 	fields    stringList
 	inline    bool
 	compact   bool
 	theme     string
+	matchesOnly bool
 }
 
 func main() {
@@ -49,18 +54,18 @@ func main() {
 	var showVersion bool
 	var orMode bool
 
-	flags := flag.NewFlagSet("lql", flag.ContinueOnError)
+	flags := pflag.NewFlagSet("lql", pflag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	flags.Var(&cfg.mutations, "m", "mutation expression (repeatable)")
-	flags.Var(&cfg.fields, "f", "field to include in output (JSON Pointer, repeatable)")
-	flags.BoolVar(&cfg.inline, "i", false, "edit input file inline")
-	flags.BoolVar(&cfg.inline, "w", false, "alias of -i")
-	flags.BoolVar(&cfg.compact, "c", false, "compact output (one JSON document per line)")
-	flags.StringVar(&cfg.theme, "t", "", "prettyx palette name")
-	flags.BoolVar(&showHelp, "h", false, "show help")
-	flags.BoolVar(&showVersion, "v", false, "show version")
-	flags.BoolVar(&orMode, "O", false, "combine selector arguments with OR")
-	flags.BoolVar(&orMode, "or", false, "alias of -O")
+	flags.VarP(&cfg.mutations, "mutate", "m", "mutation expression (repeatable)")
+	flags.VarP(&cfg.fields, "field", "f", "field to include in output (JSON Pointer, repeatable)")
+	flags.BoolVarP(&cfg.inline, "inline", "i", false, "edit input file inline")
+	flags.BoolVarP(&cfg.inline, "write", "w", false, "alias of --inline")
+	flags.BoolVarP(&cfg.compact, "compact", "c", false, "compact output (one JSON document per line)")
+	flags.StringVarP(&cfg.theme, "theme", "t", "", "prettyx palette name")
+	flags.BoolVarP(&showHelp, "help", "h", false, "show help")
+	flags.BoolVarP(&showVersion, "version", "v", false, "show version")
+	flags.BoolVarP(&orMode, "or", "O", false, "combine selector arguments with OR")
+	flags.BoolVarP(&cfg.matchesOnly, "matches-only", "M", false, "output only selector matches (even with -m)")
 	flags.Usage = func() {}
 
 	if err := flags.Parse(os.Args[1:]); err != nil {
@@ -84,7 +89,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	selectors, inputPath, err := splitArgs(flags.Args(), len(cfg.mutations) > 0)
+	var selectors []string
+	var inputPath string
+	var inputPaths []string
+	var err error
+	if len(cfg.mutations) > 0 {
+		selectors, inputPaths, err = splitMutationArgs(flags.Args(), cfg.inline)
+	} else {
+		selectors, inputPath, err = splitArgs(flags.Args(), false)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lql: %v\n", err)
 		os.Exit(2)
@@ -106,7 +119,7 @@ func main() {
 	}
 
 	if len(cfg.mutations) > 0 {
-		if err := runMutations(cfg, selector, fieldPaths, inputPath); err != nil {
+		if err := runMutations(cfg, selector, fieldPaths, inputPaths); err != nil {
 			fmt.Fprintf(os.Stderr, "lql: %v\n", err)
 			os.Exit(2)
 		}
@@ -127,64 +140,156 @@ func runSelections(cfg config, selector lql.Selector, fields []fieldPath, inputP
 	defer closeInput(reader)
 
 	enc := newOutputEncoder(os.Stdout, cfg)
-	dec := json.NewDecoder(reader)
-	dec.UseNumber()
-
-	for {
-		var value any
-		if err := dec.Decode(&value); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-		if err := emitSelectionStream(enc, selector, fields, value); err != nil {
-			return err
-		}
+	_, err = processStream(reader, enc, selectionHandler(selector, fields))
+	if err != nil {
+		return err
 	}
+	return nil
 }
 
-func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPath string) error {
-	if cfg.inline && inputPath == "" {
-		return fmt.Errorf("inline mode requires a file path")
-	}
-
-	reader, err := openInput(inputPath)
-	if err != nil {
-		return err
-	}
-	defer closeInput(reader)
-
-	doc, err := readSingleObject(reader)
-	if err != nil {
-		return err
-	}
-
+func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPaths []string) error {
 	muts, err := lql.ParseMutations(cfg.mutations, time.Now())
 	if err != nil {
 		return err
 	}
-	apply := selector.IsEmpty() || lql.Matches(selector, doc)
-	if apply {
-		if err := lql.ApplyMutations(doc, muts); err != nil {
-			return err
-		}
-	}
 
-	if len(fields) > 0 {
-		filtered, err := selectFields(doc, fields)
-		if err != nil {
-			return err
+	handler := func(value any) (any, bool, error) {
+		matches := selector.IsEmpty() || lql.MatchesValue(selector, value)
+		if cfg.matchesOnly && !matches {
+			return nil, false, nil
 		}
-		doc = filtered
+
+		var out any = value
+		if len(fields) > 0 {
+			doc, ok := value.(map[string]any)
+			if !ok {
+				return nil, false, fmt.Errorf("field selection requires JSON objects")
+			}
+			filtered, ok, err := selectFields(doc, fields)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				return nil, false, nil
+			}
+			out = filtered
+		}
+
+		if matches {
+			if doc, ok := out.(map[string]any); ok {
+				if err := lql.ApplyMutations(doc, muts); err != nil {
+					return nil, false, err
+				}
+			}
+		}
+
+		return out, true, nil
 	}
 
 	if cfg.inline {
-		return writeInline(inputPath, cfg, doc)
+		if len(inputPaths) != 1 || inputPaths[0] == "" || inputPaths[0] == "-" {
+			return fmt.Errorf("inline mode requires a single JSON file")
+		}
+		return writeInlineStream(inputPaths[0], cfg, fields, handler)
 	}
 
 	enc := newOutputEncoder(os.Stdout, cfg)
-	return enc.WriteValue(doc)
+	stats := streamStats{}
+	for _, path := range mutationInputs(inputPaths) {
+		reader, err := openInput(path)
+		if err != nil {
+			return err
+		}
+		seg, err := processStream(reader, enc, handler)
+		closeInput(reader)
+		stats.inputs += seg.inputs
+		stats.outputs += seg.outputs
+		if err != nil {
+			return err
+		}
+	}
+	if stats.inputs == 0 {
+		return fmt.Errorf("no JSON input")
+	}
+	return nil
+}
+
+type streamStats struct {
+	inputs  int
+	outputs int
+}
+
+func selectionHandler(selector lql.Selector, fields []fieldPath) func(any) (any, bool, error) {
+	return func(value any) (any, bool, error) {
+		switch node := value.(type) {
+		case map[string]any:
+			if !selector.IsEmpty() && !lql.Matches(selector, node) {
+				return nil, false, nil
+			}
+			if len(fields) == 0 {
+				return node, true, nil
+			}
+			filtered, ok, err := selectFields(node, fields)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				return nil, false, nil
+			}
+			return filtered, true, nil
+		default:
+			if !selector.IsEmpty() {
+				return nil, false, nil
+			}
+			if len(fields) > 0 {
+				return nil, false, fmt.Errorf("field selection requires JSON objects")
+			}
+			return node, true, nil
+		}
+	}
+}
+
+func processStream(r io.Reader, enc *outputEncoder, handler func(any) (any, bool, error)) (streamStats, error) {
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	stats := streamStats{}
+	for {
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			if errors.Is(err, io.EOF) {
+				return stats, nil
+			}
+			return stats, err
+		}
+		next, err := processRecord(value, enc, handler, stats)
+		if err != nil {
+			return next, err
+		}
+		stats = next
+	}
+}
+
+func processRecord(value any, enc *outputEncoder, handler func(any) (any, bool, error), stats streamStats) (streamStats, error) {
+	if arr, ok := value.([]any); ok {
+		for _, item := range arr {
+			next, err := processRecord(item, enc, handler, stats)
+			if err != nil {
+				return next, err
+			}
+			stats = next
+		}
+		return stats, nil
+	}
+	stats.inputs++
+	out, ok, err := handler(value)
+	if err != nil || !ok {
+		return stats, err
+	}
+	if err := enc.WriteValue(out); err != nil {
+		return stats, err
+	}
+	stats.outputs++
+	return stats, nil
 }
 
 func emitSelectionStream(enc *outputEncoder, selector lql.Selector, fields []fieldPath, value any) error {
@@ -208,9 +313,12 @@ func emitSelectionValue(enc *outputEncoder, selector lql.Selector, fields []fiel
 		if len(fields) == 0 {
 			return enc.WriteValue(node)
 		}
-		filtered, err := selectFields(node, fields)
+		filtered, ok, err := selectFields(node, fields)
 		if err != nil {
 			return err
+		}
+		if !ok {
+			return nil
 		}
 		return enc.WriteValue(filtered)
 	default:
@@ -267,31 +375,7 @@ func closeInput(r io.Reader) {
 	}
 }
 
-func readSingleObject(r io.Reader) (map[string]any, error) {
-	dec := json.NewDecoder(r)
-	dec.UseNumber()
-
-	var value any
-	if err := dec.Decode(&value); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("no JSON input")
-		}
-		return nil, err
-	}
-	doc, ok := value.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("mutation input must be a JSON object")
-	}
-	var extra any
-	if err := dec.Decode(&extra); err == nil {
-		return nil, fmt.Errorf("mutation input must contain a single JSON object")
-	} else if !errors.Is(err, io.EOF) {
-		return nil, err
-	}
-	return doc, nil
-}
-
-func writeInline(path string, cfg config, doc map[string]any) error {
+func writeInlineStream(path string, cfg config, fields []fieldPath, handler func(any) (any, bool, error)) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "lql-*")
 	if err != nil {
@@ -302,9 +386,19 @@ func writeInline(path string, cfg config, doc map[string]any) error {
 		_ = os.Remove(tmp.Name())
 	}()
 
-	enc := newOutputEncoder(tmp, cfg)
-	if err := enc.WriteValue(doc); err != nil {
+	reader, err := openInput(path)
+	if err != nil {
 		return err
+	}
+	defer closeInput(reader)
+
+	enc := newOutputEncoder(tmp, cfg)
+	stats, err := processStream(reader, enc, handler)
+	if err != nil {
+		return err
+	}
+	if stats.inputs == 0 {
+		return fmt.Errorf("no JSON input")
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -347,36 +441,43 @@ func parseFieldPaths(paths []string) ([]fieldPath, error) {
 	return out, nil
 }
 
-func selectFields(doc map[string]any, fields []fieldPath) (map[string]any, error) {
+func selectFields(doc map[string]any, fields []fieldPath) (map[string]any, bool, error) {
 	if doc == nil {
-		return nil, fmt.Errorf("field selection requires JSON objects")
+		return nil, false, fmt.Errorf("field selection requires JSON objects")
 	}
 	if len(fields) == 0 {
-		return doc, nil
+		return doc, true, nil
 	}
-	var root any = map[string]any{}
+	var (
+		root  any = map[string]any{}
+		found bool
+	)
 	for _, field := range fields {
 		value, ok := extractValue(doc, field.segments)
 		if !ok {
 			continue
 		}
+		found = true
 		if len(field.segments) == 0 {
 			continue
 		}
 		if _, err := strconv.Atoi(field.segments[0]); err == nil {
-			return nil, fmt.Errorf("field path %q must not start with an array index", field.raw)
+			return nil, false, fmt.Errorf("field path %q must not start with an array index", field.raw)
 		}
 		next, err := assignField(root, field.segments, value)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		root = next
 	}
+	if !found {
+		return nil, false, nil
+	}
 	out, ok := root.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("field selection failed")
+		return nil, false, fmt.Errorf("field selection failed")
 	}
-	return out, nil
+	return out, true, nil
 }
 
 func extractValue(root any, segments []string) (any, bool) {
@@ -501,6 +602,41 @@ func splitArgs(args []string, mutating bool) ([]string, string, error) {
 	return args, "", nil
 }
 
+func splitMutationArgs(args []string, inline bool) ([]string, []string, error) {
+	if len(args) == 0 {
+		return nil, nil, nil
+	}
+	var selectors []string
+	var inputs []string
+	for _, arg := range args {
+		if arg == "-" {
+			inputs = append(inputs, arg)
+			continue
+		}
+		if info, err := os.Stat(arg); err == nil && !info.IsDir() {
+			inputs = append(inputs, arg)
+			continue
+		}
+		selectors = append(selectors, arg)
+	}
+	if inline {
+		if len(inputs) == 0 {
+			return nil, nil, fmt.Errorf("inline mode requires a file path")
+		}
+		if len(inputs) != 1 || inputs[0] == "-" {
+			return nil, nil, fmt.Errorf("inline mode requires a single JSON file")
+		}
+	}
+	return selectors, inputs, nil
+}
+
+func mutationInputs(inputs []string) []string {
+	if len(inputs) == 0 {
+		return []string{""}
+	}
+	return inputs
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: lql [-m mutator...] [-f field...] selector... [data.json]")
 	fmt.Fprintln(w, "   or: lql selector... < data.json")
@@ -510,16 +646,18 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  LQL selector expressions (comma/newline separated).")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Mutations:")
-	fmt.Fprintln(w, "  -m expression    Apply mutations to a single JSON object.")
-	fmt.Fprintln(w, "  -i, -w           Write mutation output inline to the input file.")
+	fmt.Fprintln(w, "  -m, --mutate expr    Apply mutations to each JSON object in the input stream.")
+	fmt.Fprintln(w, "  -i, --inline         Write mutation output inline to a single input file.")
+	fmt.Fprintln(w, "  -w, --write          Alias of --inline.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Output:")
-	fmt.Fprintln(w, "  -f /path         Output only the selected JSON Pointer fields (repeatable).")
-	fmt.Fprintln(w, "  -c               Compact output (one JSON document per line).")
-	fmt.Fprintln(w, "  -t theme         Prettyx theme name (use with color terminals).")
-	fmt.Fprintln(w, "  -h               Show help.")
-	fmt.Fprintln(w, "  -v               Show version.")
-	fmt.Fprintln(w, "  -O, -or          Combine selector arguments with OR.")
+	fmt.Fprintln(w, "  -f, --field /path    Output only the selected JSON Pointer fields (repeatable).")
+	fmt.Fprintln(w, "  -c, --compact        Compact output (one JSON document per line).")
+	fmt.Fprintln(w, "  -t, --theme theme    Prettyx theme name (use with color terminals).")
+	fmt.Fprintln(w, "  -h, --help           Show help.")
+	fmt.Fprintln(w, "  -v, --version        Show version.")
+	fmt.Fprintln(w, "  -O, --or             Combine selector arguments with OR.")
+	fmt.Fprintln(w, "  -M, --matches-only   Output only selector matches (even with -m).")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Themes:")
 	writeWrappedList(w, "  ", prettyx.PaletteNames(), 80)
@@ -544,6 +682,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Selector OR example:")
 	fmt.Fprintln(w, "  lql -O '/status=\"open\"' '/status=\"queued\"' data.json")
 	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Note: with -m, selectors only control which objects are mutated unless -M")
+	fmt.Fprintln(w, "      is used to output only selector matches.")
 	fmt.Fprintln(w, "Note: mutations apply to a JSON object root, but paths may traverse arrays.")
 }
 

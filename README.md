@@ -111,15 +111,19 @@ usage: lql [-m mutator...] [-f field...] selector... [data.json]
 ```
 
 By default, multiple selector arguments are combined with AND. Use `-O` (or
-`-or`) to combine them with OR.
+`--or`) to combine them with OR.
 
 Selectors determine which JSON documents to output. The matching documents are
 printed in full by default. If the input is a JSON array, each element is
 treated as a candidate document.
 
-Mutations apply to a single JSON object. When selectors are provided alongside
-`-m`, the mutations are applied only if the selector matches. Output always
-contains the full (possibly mutated) object unless `-f` is used.
+Mutations apply to each JSON object in the input stream (NDJSON or JSON arrays).
+When selectors are provided alongside `-m`, mutations are applied only to
+matching objects. With `-m`, selectors no longer filter output; they only control
+which objects are mutated (output still includes all objects, subject to `-f`).
+Use `-M`/`--matches-only` to keep selectors acting as output filters even when
+`-m` is provided. Output always contains the full (possibly mutated) object
+unless `-f` is used.
 
 ### Selection examples
 
