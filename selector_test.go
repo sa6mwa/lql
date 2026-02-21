@@ -474,6 +474,63 @@ func TestParseSelectorInlineAliases(t *testing.T) {
 	}
 }
 
+func TestParseSelectorContainsVariants(t *testing.T) {
+	t.Run("contains with ic alias true", func(t *testing.T) {
+		sel, err := ParseSelectorString(`contains{f=/msg,v=timeout,ic=t}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.Contains == nil {
+			t.Fatalf("expected contains clause, got %+v", sel)
+		}
+		if sel.Contains.Field != "/msg" || sel.Contains.Value != "timeout" {
+			t.Fatalf("unexpected contains clause %+v", sel.Contains)
+		}
+		if !sel.Contains.IgnoreCase {
+			t.Fatalf("expected contains ignoreCase=true, got %+v", sel.Contains)
+		}
+	})
+
+	t.Run("contains with ignoreCase false shorthand", func(t *testing.T) {
+		sel, err := ParseSelectorString(`contains{field=/msg,value=timeout,ignoreCase=f}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.Contains == nil {
+			t.Fatalf("expected contains clause, got %+v", sel)
+		}
+		if sel.Contains.IgnoreCase {
+			t.Fatalf("expected contains ignoreCase=false, got %+v", sel.Contains)
+		}
+	})
+
+	t.Run("icontains clause", func(t *testing.T) {
+		sel, err := ParseSelectorString(`icontains{field=/msg,value=timeout}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.IContains == nil || sel.IContains.Field != "/msg" || sel.IContains.Value != "timeout" {
+			t.Fatalf("unexpected icontains clause %+v", sel)
+		}
+	})
+
+	t.Run("iprefix clause", func(t *testing.T) {
+		sel, err := ParseSelectorString(`iprefix{field=/service,value=auth-}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.IPrefix == nil || sel.IPrefix.Field != "/service" || sel.IPrefix.Value != "auth-" {
+			t.Fatalf("unexpected iprefix clause %+v", sel)
+		}
+	})
+
+	t.Run("invalid ignoreCase value", func(t *testing.T) {
+		if _, err := ParseSelectorString(`contains{field=/msg,value=timeout,ignoreCase=maybe}`); err == nil {
+			t.Fatal("expected parse error for invalid ignoreCase value")
+		}
+	})
+}
+
 func TestParseSelectorInAnyAliases(t *testing.T) {
 	expr := `in{f=/env,a=prod|stage|dev}`
 	sel, err := ParseSelectorString(expr)

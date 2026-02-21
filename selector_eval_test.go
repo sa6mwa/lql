@@ -176,6 +176,89 @@ func TestMatchExistsWildcard(t *testing.T) {
 	}
 }
 
+func TestMatchesContainsAndCaseModes(t *testing.T) {
+	doc := map[string]any{
+		"msg":     "Error: Timeout while reading",
+		"service": "Auth-Service",
+		"labels": map[string]any{
+			"owner": "ALICE-Team",
+			"env":   "prod",
+		},
+	}
+
+	cases := []struct {
+		name     string
+		expr     string
+		expected bool
+	}{
+		{
+			name:     "contains-case-sensitive-match",
+			expr:     `contains{field=/msg,value=Timeout}`,
+			expected: true,
+		},
+		{
+			name:     "contains-case-sensitive-miss",
+			expr:     `contains{field=/msg,value=timeout}`,
+			expected: false,
+		},
+		{
+			name:     "contains-ic-alias-true",
+			expr:     `contains{field=/msg,value=timeout,ic=t}`,
+			expected: true,
+		},
+		{
+			name:     "contains-ignorecase-false-shorthand",
+			expr:     `contains{field=/msg,value=timeout,ignoreCase=f}`,
+			expected: false,
+		},
+		{
+			name:     "icontains-default",
+			expr:     `icontains{field=/msg,value=timeout}`,
+			expected: true,
+		},
+		{
+			name:     "icontains-overrides-ignorecase-false",
+			expr:     `icontains{field=/msg,value=timeout,ignoreCase=f}`,
+			expected: true,
+		},
+		{
+			name:     "prefix-case-sensitive-miss",
+			expr:     `prefix{field=/service,value=auth}`,
+			expected: false,
+		},
+		{
+			name:     "prefix-ignorecase-true",
+			expr:     `prefix{field=/service,value=auth,ignoreCase=true}`,
+			expected: true,
+		},
+		{
+			name:     "iprefix-default",
+			expr:     `iprefix{field=/service,value=auth}`,
+			expected: true,
+		},
+		{
+			name:     "iprefix-overrides-ignorecase-false",
+			expr:     `iprefix{field=/service,value=auth,ignoreCase=f}`,
+			expected: true,
+		},
+		{
+			name:     "icontains-wildcard",
+			expr:     `icontains{field=/labels/*,value=alice}`,
+			expected: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sel := mustParseSelector(t, tc.expr)
+			got := Matches(sel, doc)
+			if got != tc.expected {
+				t.Fatalf("selector %q expected %v got %v", tc.expr, tc.expected, got)
+			}
+		})
+	}
+}
+
 func TestMatchesSelectorStringsAndSlice(t *testing.T) {
 	sel, err := ParseSelectorStrings([]string{`/status="ok"`, `/msg="done"`})
 	if err != nil {

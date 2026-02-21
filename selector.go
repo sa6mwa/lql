@@ -11,14 +11,17 @@ import (
 )
 
 var selectorRoots = map[string]struct{}{
-	"and":    {},
-	"or":     {},
-	"not":    {},
-	"eq":     {},
-	"prefix": {},
-	"range":  {},
-	"in":     {},
-	"exists": {},
+	"and":       {},
+	"or":        {},
+	"not":       {},
+	"eq":        {},
+	"contains":  {},
+	"icontains": {},
+	"prefix":    {},
+	"iprefix":   {},
+	"range":     {},
+	"in":        {},
+	"exists":    {},
 }
 
 var aggregatorTokens = map[string]struct{}{
@@ -959,6 +962,8 @@ func normalizeSelectorKey(key string) string {
 		return "field"
 	case "v":
 		return "value"
+	case "ic":
+		return "ignoreCase"
 	case "a":
 		return "any"
 	default:

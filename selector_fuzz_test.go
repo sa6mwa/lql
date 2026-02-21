@@ -10,6 +10,9 @@ func FuzzParseSelectorString(f *testing.F) {
 	seed := []string{
 		"",
 		"eq{field=/status,value=open}",
+		"contains{field=/msg,value=timeout,ic=t}",
+		"icontains{field=/msg,value=timeout}",
+		"iprefix{field=/service,value=auth}",
 		"and.eq{field=/status,value=open},and.eq{field=/owner,value=alice}",
 		"or.eq{field=/status,value=open},or.eq{field=/status,value=processing}",
 		"and.eq{field=/status,value=open},or.eq{field=/owner,value=\"alice\"}",

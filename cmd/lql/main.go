@@ -35,11 +35,11 @@ func (s *stringList) Type() string {
 }
 
 type config struct {
-	mutations stringList
-	fields    stringList
-	inline    bool
-	compact   bool
-	theme     string
+	mutations   stringList
+	fields      stringList
+	inline      bool
+	compact     bool
+	theme       string
 	matchesOnly bool
 }
 
@@ -159,7 +159,7 @@ func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPa
 			return nil, false, nil
 		}
 
-		var out any = value
+		out := value
 		if len(fields) > 0 {
 			doc, ok := value.(map[string]any)
 			if !ok {
@@ -674,6 +674,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Selector examples (full LQL):")
 	fmt.Fprintln(w, "  eq{field=/status,value=open}")
+	fmt.Fprintln(w, "  contains{field=/msg,value=timeout,ic=t}")
+	fmt.Fprintln(w, "  icontains{field=/msg,value=timeout}")
+	fmt.Fprintln(w, "  iprefix{field=/service,value=auth}")
 	fmt.Fprintln(w, "  and.eq{field=/status,value=open},and.range{field=/progress,gte=50}")
 	fmt.Fprintln(w, "  or.eq{field=/region,value=us},or.eq{field=/region,value=eu}")
 	fmt.Fprintln(w, "  not.eq{field=/state,value=disabled}")

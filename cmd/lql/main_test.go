@@ -73,6 +73,28 @@ func TestBuildSelectorAndOrMix(t *testing.T) {
 	}
 }
 
+func TestBuildSelectorContainsVariants(t *testing.T) {
+	sel, err := buildSelector([]string{
+		`icontains{field=/msg,value=timeout}`,
+		`iprefix{field=/service,value=auth}`,
+	}, false)
+	if err != nil {
+		t.Fatalf("buildSelector: %v", err)
+	}
+	if !lql.Matches(sel, map[string]any{
+		"msg":     "Error: TIMEOUT",
+		"service": "Auth-API",
+	}) {
+		t.Fatalf("expected selector to match case-insensitive terms")
+	}
+	if lql.Matches(sel, map[string]any{
+		"msg":     "Error: TIMEOUT",
+		"service": "billing-api",
+	}) {
+		t.Fatalf("expected selector to reject non-matching prefix")
+	}
+}
+
 func TestEmitSelectionStreamWildcards(t *testing.T) {
 	selector, err := buildSelector([]string{`/items[]/sku="B"`}, false)
 	if err != nil {

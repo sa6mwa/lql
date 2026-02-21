@@ -9,10 +9,16 @@
 // Basic forms:
 //
 //	eq{field=/status,value=open}
+//	contains{field=/message,value=timeout}
+//	icontains{field=/message,value=timeout}
 //	prefix{field=/owner,value=team-}
+//	iprefix{field=/owner,value=team-}
 //	range{field=/progress,gt=10}
 //	in{field=/state,any=["queued","running"]}
 //	exists{/metadata/etag}
+//
+// String terms (`contains`/`prefix`) support `ignoreCase=true|false`
+// (or shorthand `ic=t|f`) for per-clause case handling.
 //
 // Logical composition:
 //

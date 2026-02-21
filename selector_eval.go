@@ -38,7 +38,16 @@ func matchSelector(sel Selector, doc map[string]any) bool {
 	if sel.Eq != nil && !matchEq(sel.Eq, doc) {
 		return false
 	}
+	if sel.Contains != nil && !matchContains(sel.Contains, doc) {
+		return false
+	}
+	if sel.IContains != nil && !matchIContains(sel.IContains, doc) {
+		return false
+	}
 	if sel.Prefix != nil && !matchPrefix(sel.Prefix, doc) {
+		return false
+	}
+	if sel.IPrefix != nil && !matchIPrefix(sel.IPrefix, doc) {
 		return false
 	}
 	if sel.Range != nil && !matchRange(sel.Range, doc) {
@@ -79,6 +88,22 @@ func matchEq(term *Term, doc map[string]any) bool {
 }
 
 func matchPrefix(term *Term, doc map[string]any) bool {
+	return matchStringTerm(term, doc, strings.HasPrefix, false)
+}
+
+func matchContains(term *Term, doc map[string]any) bool {
+	return matchStringTerm(term, doc, strings.Contains, false)
+}
+
+func matchIPrefix(term *Term, doc map[string]any) bool {
+	return matchStringTerm(term, doc, strings.HasPrefix, true)
+}
+
+func matchIContains(term *Term, doc map[string]any) bool {
+	return matchStringTerm(term, doc, strings.Contains, true)
+}
+
+func matchStringTerm(term *Term, doc map[string]any, matcher func(string, string) bool, forceIgnoreCase bool) bool {
 	if term == nil || term.Field == "" {
 		return false
 	}
@@ -86,12 +111,20 @@ func matchPrefix(term *Term, doc map[string]any) bool {
 	if !ok {
 		return false
 	}
+	ignoreCase := forceIgnoreCase || term.IgnoreCase
+	needle := term.Value
+	if ignoreCase {
+		needle = strings.ToLower(needle)
+	}
 	for _, value := range values {
 		str, ok := valueToString(value)
 		if !ok {
 			continue
 		}
-		if strings.HasPrefix(str, term.Value) {
+		if ignoreCase {
+			str = strings.ToLower(str)
+		}
+		if matcher(str, needle) {
 			return true
 		}
 	}

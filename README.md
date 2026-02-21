@@ -79,6 +79,8 @@ sel, _ := lql.ParseSelectorString(`/labels/*="production"`)
 sel, _ = lql.ParseSelectorString(`/items[]/sku="ABC-123"`)
 sel, _ = lql.ParseSelectorString(`/items/**/sku="ABC-123"`)
 sel, _ = lql.ParseSelectorString(`/items/.../sku="ABC-123"`)
+sel, _ = lql.ParseSelectorString(`icontains{field=/message,value=timeout}`)
+sel, _ = lql.ParseSelectorString(`prefix{field=/service,value=auth,ignoreCase=t}`)
 ```
 
 ### Mutations
@@ -176,11 +178,21 @@ lql 'in{field=/env,any=prod|stage|dev}' data.json
 lql 'and.eq{field=/items[]/sku,value=ABC-123},and.range{field=/items[]/price,lt=20}' data.json
 ```
 
+```bash
+lql 'contains{field=/msg,value=timeout,ic=t}' data.json
+```
+
+```bash
+lql 'icontains{field=/msg,value=timeout},iprefix{field=/service,value=auth}' data.json
+```
+
 Note: full LQL expressions use `{}` and should be quoted (or the braces
 escaped) to avoid shell brace expansion.
 
-Note: inside `{}`, you can use `f=`/`v=` as aliases for `field=`/`value=`, and
-`a=` as an alias for `any=` (in `in{...}` terms).
+Note: inside `{}`, you can use `f=`/`v=` as aliases for `field=`/`value=`, `a=`
+as an alias for `any=` (in `in{...}` terms), and `ic=` as an alias for
+`ignoreCase=` in string terms (`contains`/`prefix`). `ignoreCase` accepts
+`true/false` or shorthand `t/f`.
 
 SDK (parse full LQL expressions):
 
@@ -211,6 +223,12 @@ sel, err := lql.ParseSelectorString("in{field=/env,any=prod|stage|dev}")
 ```go
 sel, err := lql.ParseSelectorString(
   "and.eq{field=/items[]/sku,value=ABC-123},and.range{field=/items[]/price,lt=20}",
+)
+```
+
+```go
+sel, err := lql.ParseSelectorString(
+  "icontains{field=/msg,value=timeout},iprefix{field=/service,value=auth}",
 )
 ```
 
@@ -287,7 +305,7 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 ## Selector grammar overview
 
 - Logical: `and`, `or`, `not`
-- Clauses: `eq`, `prefix`, `range`, `in`, `exists`
+- Clauses: `eq`, `contains`, `icontains`, `prefix`, `iprefix`, `range`, `in`, `exists`
 - JSON Pointer fields: `/path/to/field`
 - Shorthand: `/field=value`, `/field!=value`, `/field>=10`, `/field<5`
 - Arrays: `/items/0/sku="ABC-123"`
