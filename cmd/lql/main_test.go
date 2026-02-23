@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"pkt.systems/lql"
 )
@@ -23,6 +27,117 @@ func TestBuildSelectorAND(t *testing.T) {
 	}
 	if lql.Matches(sel, map[string]any{"status": "open", "progress": 10}) {
 		t.Fatalf("expected selector to reject low progress")
+	}
+}
+
+func TestWriteQueryStreamValueFromOpenJSON(t *testing.T) {
+	var out bytes.Buffer
+	enc := newOutputEncoder(&out, config{compact: true})
+	err := writeQueryStreamValue(enc, lql.QueryStreamValue{
+		OpenJSON: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(`{"id":"a","status":"ok"}`))), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("writeQueryStreamValue: %v", err)
+	}
+	values := decodeJSONValues(t, out.Bytes())
+	if len(values) != 1 {
+		t.Fatalf("expected single JSON value, got %d", len(values))
+	}
+	doc := values[0].(map[string]any)
+	if doc["id"] != "a" || doc["status"] != "ok" {
+		t.Fatalf("unexpected payload: %#v", doc)
+	}
+}
+
+func TestMutateAndWriteQueryStreamValueFromOpenJSON(t *testing.T) {
+	muts, err := lql.ParseMutations([]string{`/status=ready`}, time.Unix(1_750_000_000, 0))
+	if err != nil {
+		t.Fatalf("ParseMutations: %v", err)
+	}
+
+	var out bytes.Buffer
+	enc := newOutputEncoder(&out, config{compact: true})
+	err = mutateAndWriteQueryStreamValue(enc, lql.QueryStreamValue{
+		OpenJSON: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(`{"id":"a","status":"new"}`))), nil
+		},
+	}, muts)
+	if err != nil {
+		t.Fatalf("mutateAndWriteQueryStreamValue: %v", err)
+	}
+
+	values := decodeJSONValues(t, out.Bytes())
+	if len(values) != 1 {
+		t.Fatalf("expected one mutated value, got %d", len(values))
+	}
+	doc := values[0].(map[string]any)
+	if doc["status"] != "ready" {
+		t.Fatalf("expected mutated status, got %#v", doc["status"])
+	}
+}
+
+func TestMutateAndWriteQueryStreamValueFromOpenJSONArrayCandidate(t *testing.T) {
+	var out bytes.Buffer
+	enc := newOutputEncoder(&out, config{compact: true})
+	err := mutateAndWriteQueryStreamValue(enc, lql.QueryStreamValue{
+		OpenJSON: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(`[{"id":"a","status":"new"},{"id":"b","status":"new"}]`))), nil
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("mutateAndWriteQueryStreamValue: %v", err)
+	}
+
+	values := decodeJSONValues(t, out.Bytes())
+	if len(values) != 1 {
+		t.Fatalf("expected one mutated value, got %d", len(values))
+	}
+	items, ok := values[0].([]any)
+	if !ok {
+		t.Fatalf("expected top-level array output, got %T", values[0])
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected two array items, got %d", len(items))
+	}
+	first := items[0].(map[string]any)
+	second := items[1].(map[string]any)
+	if first["status"] != "new" {
+		t.Fatalf("expected first status unchanged, got %#v", first["status"])
+	}
+	if second["status"] != "new" {
+		t.Fatalf("expected second status unchanged, got %#v", second["status"])
+	}
+}
+
+func TestProjectQueryStreamValueFromOpenJSON(t *testing.T) {
+	fields, err := parseFieldPaths([]string{"/id"})
+	if err != nil {
+		t.Fatalf("parseFieldPaths: %v", err)
+	}
+
+	projected, found, err := projectQueryStreamValue(lql.QueryStreamValue{
+		OpenJSON: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(`{"id":"a","status":"new","blob":"` + strings.Repeat("x", 2048) + `"}`))), nil
+		},
+	}, fields, nil)
+	if err != nil {
+		t.Fatalf("projectQueryStreamValue: %v", err)
+	}
+	if !found {
+		t.Fatalf("expected projection to find /id")
+	}
+	values := decodeJSONValues(t, projected)
+	if len(values) != 1 {
+		t.Fatalf("expected one value, got %d", len(values))
+	}
+	doc := values[0].(map[string]any)
+	if doc["id"] != "a" {
+		t.Fatalf("expected id=a, got %#v", doc["id"])
+	}
+	if _, ok := doc["status"]; ok {
+		t.Fatalf("expected projected value to exclude status, got %#v", doc)
 	}
 }
 
@@ -101,34 +216,43 @@ func TestEmitSelectionStreamWildcards(t *testing.T) {
 		t.Fatalf("buildSelector: %v", err)
 	}
 
-	input := []any{
-		map[string]any{
-			"id": "a",
-			"items": []any{
-				map[string]any{"sku": "A"},
-			},
-		},
-		map[string]any{
-			"id": "b",
-			"items": []any{
-				map[string]any{"sku": "B"},
-			},
-		},
+	payload := `[{"id":"a","items":[{"sku":"A"}]},{"id":"b","items":[{"sku":"B"}]}]`
+	tmp, err := os.CreateTemp("", "lql-cli-select-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(payload); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp: %v", err)
 	}
 
-	var buf bytes.Buffer
-	enc := newOutputEncoder(&buf, config{compact: true})
-	if err := emitSelectionStream(enc, selector, nil, input); err != nil {
-		t.Fatalf("emitSelectionStream: %v", err)
+	origStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writePipe
+	err = runSelections(config{compact: true}, selector, nil, tmp.Name())
+	writePipe.Close()
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("runSelections: %v", err)
+	}
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
 	}
 
-	values := decodeJSONValues(t, buf.Bytes())
+	values := decodeJSONValues(t, output)
 	if len(values) != 1 {
 		t.Fatalf("expected 1 match, got %d", len(values))
 	}
-	doc := values[0].(map[string]any)
-	if doc["id"] != "b" {
-		t.Fatalf("expected id b, got %+v", doc["id"])
+	matchedDoc := values[0].(map[string]any)
+	if matchedDoc["id"] != "b" {
+		t.Fatalf("expected id b, got %+v", matchedDoc["id"])
 	}
 }
 
@@ -625,6 +749,302 @@ func TestSelectionsFlagOrderInterspersed(t *testing.T) {
 	docAfter := valuesAfter[0].(map[string]any)
 	if docBefore["id"] != "a" || docAfter["id"] != "a" {
 		t.Fatalf("expected id a, got %+v %+v", docBefore, docAfter)
+	}
+}
+
+func TestRunMutationsSelectorEmptyFastPathHandlesMixedStream(t *testing.T) {
+	doc := `1
+{"id":"a","status":"new"}
+[{"id":"b","status":"new"},3]`
+	tmp, err := os.CreateTemp("", "lql-cli-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(doc); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp: %v", err)
+	}
+
+	cfg := config{
+		mutations: stringList{`/status=ready`},
+		compact:   true,
+	}
+	selector, err := buildSelector(nil, false)
+	if err != nil {
+		t.Fatalf("buildSelector: %v", err)
+	}
+
+	origStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writePipe
+	err = runMutations(cfg, selector, nil, []string{tmp.Name()})
+	writePipe.Close()
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("runMutations: %v", err)
+	}
+
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	values := decodeJSONValues(t, output)
+	if len(values) != 4 {
+		t.Fatalf("expected 4 output values, got %d", len(values))
+	}
+	if values[0] != json.Number("1") {
+		t.Fatalf("expected first scalar unchanged, got %#v", values[0])
+	}
+	docA := values[1].(map[string]any)
+	docB := values[2].(map[string]any)
+	if docA["status"] != "ready" || docB["status"] != "ready" {
+		t.Fatalf("expected object statuses mutated, got %+v %+v", docA, docB)
+	}
+	if values[3] != json.Number("3") {
+		t.Fatalf("expected trailing scalar unchanged, got %#v", values[3])
+	}
+}
+
+func TestSplitArgsVariants(t *testing.T) {
+	fileA, err := os.CreateTemp("", "lql-cli-split-a-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp fileA: %v", err)
+	}
+	fileB, err := os.CreateTemp("", "lql-cli-split-b-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp fileB: %v", err)
+	}
+	defer os.Remove(fileA.Name())
+	defer os.Remove(fileB.Name())
+	_ = fileA.Close()
+	_ = fileB.Close()
+
+	dir := t.TempDir()
+	cases := []struct {
+		name          string
+		args          []string
+		mutating      bool
+		wantSelectors []string
+		wantInput     string
+		wantErrSubstr string
+	}{
+		{
+			name:          "empty args",
+			args:          nil,
+			mutating:      false,
+			wantSelectors: nil,
+			wantInput:     "",
+		},
+		{
+			name:          "stdin marker as input",
+			args:          []string{`/status="open"`, "-"},
+			mutating:      false,
+			wantSelectors: []string{`/status="open"`},
+			wantInput:     "-",
+		},
+		{
+			name:          "file as trailing input",
+			args:          []string{`/status="open"`, fileA.Name()},
+			mutating:      false,
+			wantSelectors: []string{`/status="open"`},
+			wantInput:     fileA.Name(),
+		},
+		{
+			name:          "directory is not treated as file input",
+			args:          []string{`/status="open"`, dir},
+			mutating:      false,
+			wantSelectors: []string{`/status="open"`, dir},
+			wantInput:     "",
+		},
+		{
+			name:          "mutating rejects multiple files",
+			args:          []string{fileA.Name(), fileB.Name()},
+			mutating:      true,
+			wantSelectors: nil,
+			wantInput:     "",
+			wantErrSubstr: "mutation input accepts a single JSON file",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			gotSelectors, gotInput, err := splitArgs(tc.args, tc.mutating)
+			if tc.wantErrSubstr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q", tc.wantErrSubstr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Fatalf("expected error containing %q, got %q", tc.wantErrSubstr, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("splitArgs returned error: %v", err)
+			}
+			if !reflect.DeepEqual(gotSelectors, tc.wantSelectors) {
+				t.Fatalf("selectors mismatch: got=%#v want=%#v", gotSelectors, tc.wantSelectors)
+			}
+			if gotInput != tc.wantInput {
+				t.Fatalf("input mismatch: got=%q want=%q", gotInput, tc.wantInput)
+			}
+		})
+	}
+}
+
+func TestSplitMutationArgsVariants(t *testing.T) {
+	fileA, err := os.CreateTemp("", "lql-cli-splitm-a-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp fileA: %v", err)
+	}
+	fileB, err := os.CreateTemp("", "lql-cli-splitm-b-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp fileB: %v", err)
+	}
+	defer os.Remove(fileA.Name())
+	defer os.Remove(fileB.Name())
+	_ = fileA.Close()
+	_ = fileB.Close()
+
+	cases := []struct {
+		name          string
+		args          []string
+		inline        bool
+		wantSelectors []string
+		wantInputs    []string
+		wantErrSubstr string
+	}{
+		{
+			name:          "selectors and file",
+			args:          []string{`/status=404`, fileA.Name()},
+			inline:        false,
+			wantSelectors: []string{`/status=404`},
+			wantInputs:    []string{fileA.Name()},
+		},
+		{
+			name:          "stdin input",
+			args:          []string{`/status=404`, "-"},
+			inline:        false,
+			wantSelectors: []string{`/status=404`},
+			wantInputs:    []string{"-"},
+		},
+		{
+			name:          "inline requires file path",
+			args:          []string{`/status=404`},
+			inline:        true,
+			wantErrSubstr: "inline mode requires a file path",
+		},
+		{
+			name:          "inline rejects stdin",
+			args:          []string{"-"},
+			inline:        true,
+			wantErrSubstr: "inline mode requires a single JSON file",
+		},
+		{
+			name:          "inline rejects multiple files",
+			args:          []string{fileA.Name(), fileB.Name()},
+			inline:        true,
+			wantErrSubstr: "inline mode requires a single JSON file",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			gotSelectors, gotInputs, err := splitMutationArgs(tc.args, tc.inline)
+			if tc.wantErrSubstr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q", tc.wantErrSubstr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Fatalf("expected error containing %q, got %q", tc.wantErrSubstr, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("splitMutationArgs returned error: %v", err)
+			}
+			if !reflect.DeepEqual(gotSelectors, tc.wantSelectors) {
+				t.Fatalf("selectors mismatch: got=%#v want=%#v", gotSelectors, tc.wantSelectors)
+			}
+			if !reflect.DeepEqual(gotInputs, tc.wantInputs) {
+				t.Fatalf("inputs mismatch: got=%#v want=%#v", gotInputs, tc.wantInputs)
+			}
+		})
+	}
+}
+
+func TestValidateThemeInvalid(t *testing.T) {
+	err := validateTheme("definitely-not-a-theme")
+	if err == nil {
+		t.Fatalf("expected validateTheme to reject unknown theme")
+	}
+	if !strings.Contains(err.Error(), "unknown theme") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWriteInlineMutationsCreateTempFailure(t *testing.T) {
+	muts, err := lql.ParseMutations([]string{`/status=ready`}, time.Unix(1_750_000_000, 0))
+	if err != nil {
+		t.Fatalf("ParseMutations: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "missing-dir", "doc.json")
+	err = writeInlineMutations(path, config{compact: true}, lql.Selector{}, nil, muts)
+	if err == nil {
+		t.Fatalf("expected create temp failure")
+	}
+}
+
+func TestWriteInlineMutationsNoJSONInput(t *testing.T) {
+	file, err := os.CreateTemp("", "lql-cli-inline-empty-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(file.Name())
+	if err := file.Close(); err != nil {
+		t.Fatalf("close temp: %v", err)
+	}
+
+	muts, err := lql.ParseMutations([]string{`/status=ready`}, time.Unix(1_750_000_000, 0))
+	if err != nil {
+		t.Fatalf("ParseMutations: %v", err)
+	}
+	err = writeInlineMutations(file.Name(), config{compact: true}, lql.Selector{}, nil, muts)
+	if err == nil {
+		t.Fatalf("expected no JSON input error")
+	}
+	if !strings.Contains(err.Error(), "no JSON input") {
+		t.Fatalf("expected no JSON input error, got %v", err)
+	}
+}
+
+func TestWriteInlineMutationsInvalidJSON(t *testing.T) {
+	file, err := os.CreateTemp("", "lql-cli-inline-invalid-*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(file.Name())
+	if _, err := file.WriteString(`{"id":`); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close temp: %v", err)
+	}
+
+	muts, err := lql.ParseMutations([]string{`/status=ready`}, time.Unix(1_750_000_000, 0))
+	if err != nil {
+		t.Fatalf("ParseMutations: %v", err)
+	}
+	err = writeInlineMutations(file.Name(), config{compact: true}, lql.Selector{}, nil, muts)
+	if err == nil {
+		t.Fatalf("expected invalid JSON error")
 	}
 }
 

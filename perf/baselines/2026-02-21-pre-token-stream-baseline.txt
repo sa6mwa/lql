@@ -1,0 +1,60 @@
+goos: linux
+goarch: amd64
+pkg: pkt.systems/lql/cmd/lql
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reuse_selector-12         	       1	 507354850 ns/op	204277344 B/op	 7584692 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reuse_selector-12         	       1	 477928046 ns/op	204276624 B/op	 7584684 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reuse_selector-12         	       1	 528157737 ns/op	204276592 B/op	 7584683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reparse_selector_each_run-12         	       1	 462954618 ns/op	204283976 B/op	 7584767 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reparse_selector_each_run-12         	       1	 557311130 ns/op	204283992 B/op	 7584767 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reparse_selector_each_run-12         	       1	 439397043 ns/op	204283960 B/op	 7584767 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reuse_selector-12                	       1	 450254356 ns/op	212619952 B/op	 8024683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reuse_selector-12                	       1	 429922222 ns/op	212619952 B/op	 8024683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reuse_selector-12                	       1	 429101867 ns/op	212619920 B/op	 8024683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reparse_selector_each_run-12     	       1	 437214982 ns/op	212630392 B/op	 8024851 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reparse_selector_each_run-12     	       1	 429630453 ns/op	212630392 B/op	 8024851 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reparse_selector_each_run-12     	       1	 434590807 ns/op	212630376 B/op	 8024851 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reuse_selector-12                  	       1	 441371408 ns/op	205155120 B/op	 7584683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reuse_selector-12                  	       1	 435032443 ns/op	205155104 B/op	 7584683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reuse_selector-12                  	       1	 426505430 ns/op	205155104 B/op	 7584683 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reparse_selector_each_run-12       	       1	 425431622 ns/op	205160440 B/op	 7584760 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reparse_selector_each_run-12       	       1	 415474261 ns/op	205160440 B/op	 7584760 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reparse_selector_each_run-12       	       1	 417373954 ns/op	205160456 B/op	 7584760 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reuse_selector-12                     	       1	 439824851 ns/op	350335624 B/op	 7424732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reuse_selector-12                     	       1	 398401715 ns/op	350335608 B/op	 7424732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reuse_selector-12                     	       1	 386632042 ns/op	350335624 B/op	 7424732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reparse_selector_each_run-12          	       1	 434818525 ns/op	350343008 B/op	 7424816 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reparse_selector_each_run-12          	       1	 390583125 ns/op	350342976 B/op	 7424816 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reparse_selector_each_run-12          	       1	 422294979 ns/op	350342992 B/op	 7424816 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reuse_selector-12                 	       1	 462511263 ns/op	358655624 B/op	 7864732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reuse_selector-12                 	       1	 418185636 ns/op	358655624 B/op	 7864732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reuse_selector-12                 	       1	 402660224 ns/op	358655624 B/op	 7864732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reparse_selector_each_run-12      	       1	 413220446 ns/op	358666080 B/op	 7864900 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reparse_selector_each_run-12      	       1	 402918353 ns/op	358666096 B/op	 7864900 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reparse_selector_each_run-12      	       1	 395348384 ns/op	358666096 B/op	 7864900 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reuse_selector-12                   	       1	 415856705 ns/op	350341184 B/op	 7424739 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reuse_selector-12                   	       1	 389431574 ns/op	350335608 B/op	 7424732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reuse_selector-12                   	       1	 384029520 ns/op	350335640 B/op	 7424732 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reparse_selector_each_run-12        	       1	 380479375 ns/op	350340960 B/op	 7424809 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reparse_selector_each_run-12        	       1	 399329108 ns/op	350340944 B/op	 7424809 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reparse_selector_each_run-12        	       1	 385815293 ns/op	350340944 B/op	 7424809 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reuse_selector-12          	       1	 297087212 ns/op	230528496 B/op	 4728618 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reuse_selector-12          	       1	 278715829 ns/op	230528464 B/op	 4728618 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reuse_selector-12          	       1	 270181150 ns/op	230528480 B/op	 4728618 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reparse_selector_each_run-12         	       1	 271428636 ns/op	230536024 B/op	 4728705 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reparse_selector_each_run-12         	       1	 341669566 ns/op	230536040 B/op	 4728705 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reparse_selector_each_run-12         	       1	 334648019 ns/op	230535720 B/op	 4728701 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reuse_selector-12              	       1	 386819886 ns/op	255019576 B/op	 4728691 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reuse_selector-12              	       1	 316407554 ns/op	255019560 B/op	 4728691 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reuse_selector-12              	       1	 319602383 ns/op	255019560 B/op	 4728691 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reparse_selector_each_run-12   	       1	 368217160 ns/op	255030208 B/op	 4728861 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reparse_selector_each_run-12   	       1	 381021395 ns/op	255030208 B/op	 4728861 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reparse_selector_each_run-12   	       1	 448436070 ns/op	255030192 B/op	 4728861 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reuse_selector-12                	       1	 376438846 ns/op	230528480 B/op	 4728618 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reuse_selector-12                	       1	 343607345 ns/op	230528464 B/op	 4728618 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reuse_selector-12                	       1	 399206673 ns/op	230528480 B/op	 4728618 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reparse_selector_each_run-12     	       1	 279532997 ns/op	230533896 B/op	 4728696 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reparse_selector_each_run-12     	       1	 268463719 ns/op	230533880 B/op	 4728696 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reparse_selector_each_run-12     	       1	 274587929 ns/op	230533896 B/op	 4728696 allocs/op
+PASS
+ok  	pkt.systems/lql/cmd/lql	23.611s

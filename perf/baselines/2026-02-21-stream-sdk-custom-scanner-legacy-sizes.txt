@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: pkt.systems/lql/cmd/lql
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reuse_selector-12         	       1	 150760982 ns/op	   68712 B/op	      29 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reparse_selector_each_run-12         	       1	 144425239 ns/op	   74976 B/op	     100 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reuse_selector-12                	       1	 179328909 ns/op	   68616 B/op	      37 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reparse_selector_each_run-12     	       1	 172269066 ns/op	   79056 B/op	     205 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reuse_selector-12                  	       1	 148235417 ns/op	   68056 B/op	      22 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reparse_selector_each_run-12       	       1	 149293235 ns/op	   73216 B/op	      96 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reuse_selector-12                     	       1	 145666366 ns/op	   68056 B/op	      22 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reparse_selector_each_run-12          	       1	 144576990 ns/op	   74976 B/op	     100 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reuse_selector-12                 	       1	 172165934 ns/op	   68616 B/op	      37 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reparse_selector_each_run-12      	       1	 172216063 ns/op	   78752 B/op	     200 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reuse_selector-12                   	       1	 159664234 ns/op	   68056 B/op	      22 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reparse_selector_each_run-12        	       1	 148436713 ns/op	   73392 B/op	      99 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reuse_selector-12          	       1	  96463650 ns/op	   68336 B/op	      28 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reparse_selector_each_run-12         	       1	  95375245 ns/op	   75384 B/op	     108 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reuse_selector-12              	       1	  96632528 ns/op	   69208 B/op	      49 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reparse_selector_each_run-12   	       1	  99597970 ns/op	   79856 B/op	     219 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reuse_selector-12                	       1	  94902961 ns/op	   68336 B/op	      28 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reparse_selector_each_run-12     	       1	  95820289 ns/op	   73752 B/op	     106 allocs/op
+PASS
+ok  	pkt.systems/lql/cmd/lql	3.800s

@@ -3,18 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
 	"pkt.systems/lql"
-	"pkt.systems/lql/jsonpointer"
 	"pkt.systems/prettyx"
 	"pkt.systems/version"
 )
@@ -139,12 +136,36 @@ func runSelections(cfg config, selector lql.Selector, fields []fieldPath, inputP
 	}
 	defer closeInput(reader)
 
-	enc := newOutputEncoder(os.Stdout, cfg)
-	_, err = processStream(reader, enc, selectionHandler(selector, fields))
-	if err != nil {
-		return err
+	var projectionPlan *lql.ProjectionPlan
+	if len(fields) > 0 {
+		projectionPlan, err = lql.NewProjectionPlan(fields)
+		if err != nil {
+			return err
+		}
 	}
-	return nil
+
+	enc := newOutputEncoder(os.Stdout, cfg)
+	return lql.QueryStream(lql.QueryStreamRequest{
+		Reader:      reader,
+		Selector:    selector,
+		IncludeJSON: true,
+		OnValue: func(value lql.QueryStreamValue) error {
+			if !value.Matched {
+				return nil
+			}
+			if len(fields) == 0 {
+				return writeQueryStreamValue(enc, value)
+			}
+			projected, found, err := projectQueryStreamValue(value, fields, projectionPlan)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return nil
+			}
+			return enc.WriteRawJSON(projected)
+		},
+	})
 }
 
 func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPaths []string) error {
@@ -153,44 +174,11 @@ func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPa
 		return err
 	}
 
-	handler := func(value any) (any, bool, error) {
-		matches := selector.IsEmpty() || lql.MatchesValue(selector, value)
-		if cfg.matchesOnly && !matches {
-			return nil, false, nil
-		}
-
-		out := value
-		if len(fields) > 0 {
-			doc, ok := value.(map[string]any)
-			if !ok {
-				return nil, false, fmt.Errorf("field selection requires JSON objects")
-			}
-			filtered, ok, err := selectFields(doc, fields)
-			if err != nil {
-				return nil, false, err
-			}
-			if !ok {
-				return nil, false, nil
-			}
-			out = filtered
-		}
-
-		if matches {
-			if doc, ok := out.(map[string]any); ok {
-				if err := lql.ApplyMutations(doc, muts); err != nil {
-					return nil, false, err
-				}
-			}
-		}
-
-		return out, true, nil
-	}
-
 	if cfg.inline {
 		if len(inputPaths) != 1 || inputPaths[0] == "" || inputPaths[0] == "-" {
 			return fmt.Errorf("inline mode requires a single JSON file")
 		}
-		return writeInlineStream(inputPaths[0], cfg, fields, handler)
+		return writeInlineMutations(inputPaths[0], cfg, selector, fields, muts)
 	}
 
 	enc := newOutputEncoder(os.Stdout, cfg)
@@ -200,7 +188,7 @@ func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPa
 		if err != nil {
 			return err
 		}
-		seg, err := processStream(reader, enc, handler)
+		seg, err := processMutationStream(reader, enc, selector, fields, muts, cfg.matchesOnly)
 		closeInput(reader)
 		stats.inputs += seg.inputs
 		stats.outputs += seg.outputs
@@ -219,117 +207,196 @@ type streamStats struct {
 	outputs int
 }
 
-func selectionHandler(selector lql.Selector, fields []fieldPath) func(any) (any, bool, error) {
-	return func(value any) (any, bool, error) {
-		switch node := value.(type) {
-		case map[string]any:
-			if !selector.IsEmpty() && !lql.Matches(selector, node) {
-				return nil, false, nil
-			}
-			if len(fields) == 0 {
-				return node, true, nil
-			}
-			filtered, ok, err := selectFields(node, fields)
-			if err != nil {
-				return nil, false, err
-			}
-			if !ok {
-				return nil, false, nil
-			}
-			return filtered, true, nil
-		default:
-			if !selector.IsEmpty() {
-				return nil, false, nil
-			}
-			if len(fields) > 0 {
-				return nil, false, fmt.Errorf("field selection requires JSON objects")
-			}
-			return node, true, nil
-		}
-	}
-}
-
-func processStream(r io.Reader, enc *outputEncoder, handler func(any) (any, bool, error)) (streamStats, error) {
-	dec := json.NewDecoder(r)
-	dec.UseNumber()
+func processMutationStream(r io.Reader, enc *outputEncoder, selector lql.Selector, fields []fieldPath, muts []lql.Mutation, matchesOnly bool) (streamStats, error) {
 	stats := streamStats{}
-	for {
-		var value any
-		if err := dec.Decode(&value); err != nil {
-			if errors.Is(err, io.EOF) {
-				return stats, nil
-			}
+	if selector.IsEmpty() && len(fields) == 0 && !matchesOnly {
+		return processMutationStreamUngated(r, enc, muts)
+	}
+	var err error
+	var projectionPlan *lql.ProjectionPlan
+	if len(fields) > 0 {
+		projectionPlan, err = lql.NewProjectionPlan(fields)
+		if err != nil {
 			return stats, err
 		}
-		next, err := processRecord(value, enc, handler, stats)
-		if err != nil {
-			return next, err
-		}
-		stats = next
 	}
-}
-
-func processRecord(value any, enc *outputEncoder, handler func(any) (any, bool, error), stats streamStats) (streamStats, error) {
-	if arr, ok := value.([]any); ok {
-		for _, item := range arr {
-			next, err := processRecord(item, enc, handler, stats)
-			if err != nil {
-				return next, err
+	err = lql.QueryStream(lql.QueryStreamRequest{
+		Reader:      r,
+		Selector:    selector,
+		IncludeJSON: true,
+		OnValue: func(value lql.QueryStreamValue) error {
+			stats.inputs++
+			if matchesOnly && !value.Matched {
+				return nil
 			}
-			stats = next
-		}
-		return stats, nil
-	}
-	stats.inputs++
-	out, ok, err := handler(value)
-	if err != nil || !ok {
+
+			if value.Matched && len(muts) > 0 && len(fields) == 0 {
+				if err := mutateAndWriteQueryStreamValue(enc, value, muts); err != nil {
+					return err
+				}
+				stats.outputs++
+				return nil
+			}
+
+			if len(fields) == 0 {
+				if err := writeQueryStreamValue(enc, value); err != nil {
+					return err
+				}
+				stats.outputs++
+				return nil
+			}
+
+			projected, found, err := projectQueryStreamValue(value, fields, projectionPlan)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return nil
+			}
+			if value.Matched {
+				if len(muts) > 0 {
+					if err := mutateAndWriteQueryStreamValue(enc, lql.QueryStreamValue{JSON: projected}, muts); err != nil {
+						return err
+					}
+					stats.outputs++
+					return nil
+				}
+			}
+			if err := enc.WriteRawJSON(projected); err != nil {
+				return err
+			}
+			stats.outputs++
+			return nil
+		},
+	})
+	if err != nil {
 		return stats, err
 	}
-	if err := enc.WriteValue(out); err != nil {
-		return stats, err
-	}
-	stats.outputs++
 	return stats, nil
 }
 
-func emitSelectionStream(enc *outputEncoder, selector lql.Selector, fields []fieldPath, value any) error {
-	if arr, ok := value.([]any); ok {
-		for _, item := range arr {
-			if err := emitSelectionValue(enc, selector, fields, item); err != nil {
-				return err
-			}
-		}
-		return nil
+func projectQueryStreamValue(value lql.QueryStreamValue, fields []fieldPath, plan *lql.ProjectionPlan) ([]byte, bool, error) {
+	reader, err := openQueryStreamValue(value)
+	if err != nil {
+		return nil, false, err
 	}
-	return emitSelectionValue(enc, selector, fields, value)
+	defer reader.Close()
+
+	var out bytes.Buffer
+	result, err := lql.ProjectFields(lql.ProjectFieldsRequest{
+		Reader: reader,
+		Writer: &out,
+		Paths:  fields,
+		Plan:   plan,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if !result.Found {
+		return nil, false, nil
+	}
+	return out.Bytes(), true, nil
 }
 
-func emitSelectionValue(enc *outputEncoder, selector lql.Selector, fields []fieldPath, value any) error {
-	switch node := value.(type) {
-	case map[string]any:
-		if !selector.IsEmpty() && !lql.Matches(selector, node) {
-			return nil
-		}
-		if len(fields) == 0 {
-			return enc.WriteValue(node)
-		}
-		filtered, ok, err := selectFields(node, fields)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil
-		}
-		return enc.WriteValue(filtered)
-	default:
-		if !selector.IsEmpty() {
-			return nil
-		}
-		if len(fields) > 0 {
-			return fmt.Errorf("field selection requires JSON objects")
-		}
-		return enc.WriteValue(node)
+func mutateAndWriteQueryStreamValue(enc *outputEncoder, value lql.QueryStreamValue, muts []lql.Mutation) error {
+	reader, err := openQueryStreamValue(value)
+	if err != nil {
+		return err
 	}
+	defer reader.Close()
+
+	pipeReader, pipeWriter := io.Pipe()
+	mutateErrCh := make(chan error, 1)
+	go func() {
+		err := lql.MutateStream(lql.MutateStreamRequest{
+			Reader:    reader,
+			Writer:    pipeWriter,
+			Mode:      lql.MutateSingleValueOnly,
+			Mutations: muts,
+		})
+		if err != nil {
+			_ = pipeWriter.CloseWithError(err)
+			mutateErrCh <- err
+			return
+		}
+		if err := pipeWriter.Close(); err != nil {
+			mutateErrCh <- err
+			return
+		}
+		mutateErrCh <- nil
+	}()
+
+	writeErr := enc.WriteRawJSONReader(pipeReader)
+	if writeErr != nil {
+		_ = pipeReader.CloseWithError(writeErr)
+	} else {
+		_ = pipeReader.Close()
+	}
+	mutateErr := <-mutateErrCh
+	if writeErr != nil {
+		return writeErr
+	}
+	return mutateErr
+}
+
+func processMutationStreamUngated(r io.Reader, enc *outputEncoder, muts []lql.Mutation) (streamStats, error) {
+	stats := streamStats{}
+	writer := &mutationStreamOutputWriter{
+		enc:   enc,
+		stats: &stats,
+		buf:   make([]byte, 0, 4096),
+	}
+	err := lql.MutateStream(lql.MutateStreamRequest{
+		Reader:    r,
+		Writer:    writer,
+		Mutations: muts,
+	})
+	if err != nil {
+		return stats, err
+	}
+	if err := writer.Flush(); err != nil {
+		return stats, err
+	}
+	return stats, nil
+}
+
+type mutationStreamOutputWriter struct {
+	enc   *outputEncoder
+	stats *streamStats
+	buf   []byte
+}
+
+func (w *mutationStreamOutputWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		idx := bytes.IndexByte(w.buf, '\n')
+		if idx < 0 {
+			break
+		}
+		line := w.buf[:idx]
+		if len(line) > 0 {
+			if err := w.enc.WriteRawJSON(line); err != nil {
+				return 0, err
+			}
+			w.stats.inputs++
+			w.stats.outputs++
+		}
+		w.buf = w.buf[idx+1:]
+	}
+	return len(p), nil
+}
+
+func (w *mutationStreamOutputWriter) Flush() error {
+	if len(w.buf) == 0 {
+		return nil
+	}
+	if err := w.enc.WriteRawJSON(w.buf); err != nil {
+		return err
+	}
+	w.stats.inputs++
+	w.stats.outputs++
+	w.buf = w.buf[:0]
+	return nil
 }
 
 type outputEncoder struct {
@@ -355,11 +422,48 @@ func (o *outputEncoder) WriteValue(value any) error {
 	if err != nil {
 		return err
 	}
+	return o.writePayload(payload)
+}
+
+func (o *outputEncoder) WriteRawJSON(payload []byte) error {
+	return o.writePayload(payload)
+}
+
+func (o *outputEncoder) WriteRawJSONReader(r io.Reader) error {
+	if o.compact {
+		return prettyx.CompactTo(o.writer, r, &o.opts)
+	}
+	return prettyx.PrettyStream(o.writer, r, &o.opts)
+}
+
+func (o *outputEncoder) writePayload(payload []byte) error {
 	reader := bytes.NewReader(payload)
 	if o.compact {
 		return prettyx.CompactTo(o.writer, reader, &o.opts)
 	}
 	return prettyx.PrettyStream(o.writer, reader, &o.opts)
+}
+
+func openQueryStreamValue(value lql.QueryStreamValue) (io.ReadCloser, error) {
+	if len(value.JSON) > 0 {
+		return io.NopCloser(bytes.NewReader(value.JSON)), nil
+	}
+	if value.OpenJSON == nil {
+		return nil, fmt.Errorf("query stream candidate payload unavailable")
+	}
+	return value.OpenJSON()
+}
+
+func writeQueryStreamValue(enc *outputEncoder, value lql.QueryStreamValue) error {
+	if len(value.JSON) > 0 {
+		return enc.WriteRawJSON(value.JSON)
+	}
+	reader, err := openQueryStreamValue(value)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	return enc.WriteRawJSONReader(reader)
 }
 
 func openInput(path string) (io.Reader, error) {
@@ -375,7 +479,7 @@ func closeInput(r io.Reader) {
 	}
 }
 
-func writeInlineStream(path string, cfg config, fields []fieldPath, handler func(any) (any, bool, error)) error {
+func writeInlineMutations(path string, cfg config, selector lql.Selector, fields []fieldPath, muts []lql.Mutation) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "lql-*")
 	if err != nil {
@@ -393,7 +497,7 @@ func writeInlineStream(path string, cfg config, fields []fieldPath, handler func
 	defer closeInput(reader)
 
 	enc := newOutputEncoder(tmp, cfg)
-	stats, err := processStream(reader, enc, handler)
+	stats, err := processMutationStream(reader, enc, selector, fields, muts, cfg.matchesOnly)
 	if err != nil {
 		return err
 	}
@@ -411,156 +515,10 @@ func writeInlineStream(path string, cfg config, fields []fieldPath, handler func
 	return os.Rename(tmp.Name(), path)
 }
 
-type fieldPath struct {
-	raw      string
-	segments []string
-}
+type fieldPath = lql.ProjectionPath
 
 func parseFieldPaths(paths []string) ([]fieldPath, error) {
-	if len(paths) == 0 {
-		return nil, nil
-	}
-	out := make([]fieldPath, 0, len(paths))
-	for _, raw := range paths {
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" {
-			continue
-		}
-		segments, err := jsonpointer.Split(trimmed)
-		if err != nil {
-			return nil, err
-		}
-		if len(segments) == 0 {
-			return nil, fmt.Errorf("field path %q refers to document root", raw)
-		}
-		out = append(out, fieldPath{raw: trimmed, segments: segments})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no valid field paths provided")
-	}
-	return out, nil
-}
-
-func selectFields(doc map[string]any, fields []fieldPath) (map[string]any, bool, error) {
-	if doc == nil {
-		return nil, false, fmt.Errorf("field selection requires JSON objects")
-	}
-	if len(fields) == 0 {
-		return doc, true, nil
-	}
-	var (
-		root  any = map[string]any{}
-		found bool
-	)
-	for _, field := range fields {
-		value, ok := extractValue(doc, field.segments)
-		if !ok {
-			continue
-		}
-		found = true
-		if len(field.segments) == 0 {
-			continue
-		}
-		if _, err := strconv.Atoi(field.segments[0]); err == nil {
-			return nil, false, fmt.Errorf("field path %q must not start with an array index", field.raw)
-		}
-		next, err := assignField(root, field.segments, value)
-		if err != nil {
-			return nil, false, err
-		}
-		root = next
-	}
-	if !found {
-		return nil, false, nil
-	}
-	out, ok := root.(map[string]any)
-	if !ok {
-		return nil, false, fmt.Errorf("field selection failed")
-	}
-	return out, true, nil
-}
-
-func extractValue(root any, segments []string) (any, bool) {
-	current := root
-	for _, segment := range segments {
-		switch node := current.(type) {
-		case map[string]any:
-			value, ok := node[segment]
-			if !ok {
-				return nil, false
-			}
-			current = value
-		case []any:
-			index, err := strconv.Atoi(segment)
-			if err != nil || index < 0 || index >= len(node) {
-				return nil, false
-			}
-			current = node[index]
-		default:
-			return nil, false
-		}
-	}
-	return current, true
-}
-
-const maxFieldIndex = 1 << 20
-
-func assignField(node any, path []string, value any) (any, error) {
-	if len(path) == 0 {
-		return value, nil
-	}
-	token := path[0]
-	last := len(path) == 1
-	if idx, err := strconv.Atoi(token); err == nil {
-		if idx < 0 || idx > maxFieldIndex {
-			return nil, fmt.Errorf("field index %d invalid", idx)
-		}
-		var arr []any
-		switch v := node.(type) {
-		case nil:
-			arr = make([]any, idx+1)
-		case []any:
-			arr = v
-			if idx >= len(arr) {
-				grow := idx - len(arr) + 1
-				if grow > maxFieldIndex {
-					return nil, fmt.Errorf("field index %d invalid", idx)
-				}
-				arr = append(arr, make([]any, grow)...)
-			}
-		default:
-			return nil, fmt.Errorf("field path conflict at %s", token)
-		}
-		if last {
-			arr[idx] = value
-			return arr, nil
-		}
-		next, err := assignField(arr[idx], path[1:], value)
-		if err != nil {
-			return nil, err
-		}
-		arr[idx] = next
-		return arr, nil
-	}
-	var obj map[string]any
-	switch v := node.(type) {
-	case nil:
-		obj = make(map[string]any)
-	case map[string]any:
-		obj = v
-	default:
-		return nil, fmt.Errorf("field path conflict at %s", token)
-	}
-	if last {
-		obj[token] = value
-		return obj, nil
-	}
-	next, err := assignField(obj[token], path[1:], value)
-	if err != nil {
-		return nil, err
-	}
-	obj[token] = next
-	return obj, nil
+	return lql.ParseProjectionPaths(paths)
 }
 
 func validateTheme(theme string) error {

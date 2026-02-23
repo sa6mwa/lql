@@ -3,6 +3,7 @@
 /testdata
 /.testbin
 /.gocache
+/stash/
 \#*\#
 .vscode/
 .idea/

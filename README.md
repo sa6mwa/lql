@@ -119,6 +119,50 @@ _ = lql.MutateWithTime(doc, time.Now(), `time:/state/updated=NOW`)
 Mutations support the same wildcard semantics as selectors; missing paths under
 wildcards are skipped.
 
+Stream mutations over large inputs without loading the whole stream:
+
+```go
+muts, _ := lql.ParseMutations([]string{`/state/status=running`}, time.Now())
+_ = lql.MutateStream(lql.MutateStreamRequest{
+  Ctx: context.Background(),
+  Reader: strings.NewReader(`{"state":{"status":"queued"}}`),
+  Writer: io.Discard, // optional compact NDJSON sink
+  Mutations: muts,
+  OnValue: func(v lql.MutateStreamValue) error {
+    fmt.Printf("%s\n", v.JSON)
+    return nil
+  },
+})
+```
+
+`QueryStream` supports `QueryDecisionOnly` and `QueryDecisionPlusValue` modes,
+and both stream APIs return typed `*StreamError` values with machine-usable
+codes (`invalid_selector`, `invalid_body`, `document_too_large`,
+`context_canceled`, `internal`).
+Helper predicates are available:
+`IsStreamInvalidSelector`, `IsStreamInvalidBody`,
+`IsStreamDocumentTooLarge`, `IsStreamContextCanceled`, `IsStreamInternal`.
+
+Selector capability routing helpers are available via
+`InspectSelectorCapabilities`.
+
+In `QueryDecisionPlusValue`/`IncludeJSON` mode, candidate payloads spool in
+memory up to 5 MiB by default, then spill to temp files (`/tmp` by default).
+Configure with `SpoolMemoryBytes`, `SpoolTempDir`, and `SpoolFilePattern`.
+Set `MatchedOnly` to invoke callbacks only for matched candidates.
+
+For caller-managed payload storage, set `DisableInternalSpool=true` and provide
+`PayloadSinkFactory` with a custom `QueryStreamPayloadSink`.
+
+`MutateStream` supports strict framing/root modes:
+`MutateSingleValueOnly`, `MutateObjectRootOnly`, and
+`MutateSingleObjectOnly`.
+
+Candidate size accounting contract:
+- `QueryStream MaxCandidateBytes` and `QueryStreamValue.Size` count bytes from
+  the first non-whitespace byte of each candidate to its closing JSON token.
+- Top-level separators and surrounding whitespace are excluded.
+
 ## CLI usage
 
 ```

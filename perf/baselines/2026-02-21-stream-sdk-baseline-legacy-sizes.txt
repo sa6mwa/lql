@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: pkt.systems/lql/cmd/lql
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reuse_selector-12         	       1	1081877020 ns/op	425605112 B/op	23424703 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/eq_status_open/reparse_selector_each_run-12         	       1	1055622706 ns/op	425611872 B/op	23424781 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reuse_selector-12                	       1	1113759920 ns/op	425605048 B/op	23424712 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/and_region_latency/reparse_selector_each_run-12     	       1	1084374997 ns/op	425615472 B/op	23424880 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reuse_selector-12                  	       1	1091490243 ns/op	425604456 B/op	23424697 allocs/op
+BenchmarkLQLSelectionBaseline/large_ndjson/contains_service/reparse_selector_each_run-12       	       1	1052896153 ns/op	425609792 B/op	23424774 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reuse_selector-12                     	       1	1079619661 ns/op	425604504 B/op	23424698 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/eq_status_open/reparse_selector_each_run-12          	       1	1053825668 ns/op	425611888 B/op	23424782 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reuse_selector-12                 	       1	1122352214 ns/op	425605064 B/op	23424713 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/and_region_latency/reparse_selector_each_run-12      	       1	1089535304 ns/op	425615504 B/op	23424881 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reuse_selector-12                   	       1	1085819650 ns/op	425604504 B/op	23424699 allocs/op
+BenchmarkLQLSelectionBaseline/large_array/contains_service/reparse_selector_each_run-12        	       1	1053540398 ns/op	425609840 B/op	23424775 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reuse_selector-12          	       1	 815808727 ns/op	319205680 B/op	17568588 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_status_match/reparse_selector_each_run-12         	       1	 799667157 ns/op	319213352 B/op	17568676 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reuse_selector-12              	       1	 807124139 ns/op	319206568 B/op	17568609 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_and_region_latency/reparse_selector_each_run-12   	       1	 806385677 ns/op	319217200 B/op	17568779 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reuse_selector-12                	       1	 808578244 ns/op	319205696 B/op	17568588 allocs/op
+BenchmarkLQLSelectionBaseline/large_single_json/nested_contains_service/reparse_selector_each_run-12     	       1	 798580901 ns/op	319211112 B/op	17568666 allocs/op
+PASS
+ok  	pkt.systems/lql/cmd/lql	19.219s

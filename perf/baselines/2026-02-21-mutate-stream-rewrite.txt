@@ -1,0 +1,20 @@
+# Mutate Stream benchmark baseline
+# Date: 2026-02-21
+# Command:
+LQL_BENCH_MUTATE_NDJSON_COUNT=5000 LQL_BENCH_MUTATE_ARRAY_COUNT=5000 LQL_BENCH_MUTATE_SINGLE_COUNT=4000 go test . -run ^$ -bench BenchmarkMutateStreamSynthetic -benchmem -benchtime=1x
+
+goos: linux
+goarch: amd64
+pkg: pkt.systems/lql
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkMutateStreamSynthetic/large_ndjson/reuse_program/writer_stream-12         	       1	  73731561 ns/op	43768400 B/op	  575152 allocs/op
+BenchmarkMutateStreamSynthetic/large_ndjson/reuse_program/callback_raw_json-12     	       1	  54381353 ns/op	44021384 B/op	  585242 allocs/op
+BenchmarkMutateStreamSynthetic/large_ndjson/reparse_program_each_run-12            	       1	  54658921 ns/op	43769272 B/op	  575193 allocs/op
+BenchmarkMutateStreamSynthetic/large_array/reuse_program/writer_stream-12          	       1	  63486922 ns/op	43774696 B/op	  575171 allocs/op
+BenchmarkMutateStreamSynthetic/large_array/reuse_program/callback_raw_json-12      	       1	  77137918 ns/op	44018776 B/op	  585197 allocs/op
+BenchmarkMutateStreamSynthetic/large_array/reparse_program_each_run-12             	       1	  75488039 ns/op	43768488 B/op	  575184 allocs/op
+BenchmarkMutateStreamSynthetic/large_single_json/reuse_program/writer_stream-12    	       1	  38284862 ns/op	17512064 B/op	  220113 allocs/op
+BenchmarkMutateStreamSynthetic/large_single_json/reuse_program/callback_raw_json-12         	       1	  28119566 ns/op	18078608 B/op	  220103 allocs/op
+BenchmarkMutateStreamSynthetic/large_single_json/reparse_program_each_run-12                	       1	  30065592 ns/op	17505592 B/op	  220129 allocs/op
+PASS
+ok  	pkt.systems/lql	0.596s

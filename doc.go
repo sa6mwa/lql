@@ -84,4 +84,44 @@
 //
 // The package is intentionally small and dependency-free so it can be embedded
 // in CLIs and services that need LQL parsing or evaluation.
+//
+// # Streaming Queries
+//
+// Query streams can be evaluated without materializing full JSON objects:
+//
+//	sel, _ := lql.ParseSelectorString(`/status="open"`)
+//	_ = lql.QueryStream(lql.QueryStreamRequest{
+//	  Reader: strings.NewReader(`{"status":"open"}`),
+//	  Ctx: context.Background(),
+//	  Selector: sel,
+//	  Mode: lql.QueryDecisionPlusValue,
+//	  MatchedOnly: true,
+//	  OnValue: func(v lql.QueryStreamValue) error {
+//	    if v.Matched {
+//	      // v.JSON contains candidate payload bytes when in-memory.
+//	      // If spooled to disk, use v.OpenJSON.
+//	    }
+//	    return nil
+//	  },
+//	})
+//
+// # Streaming Mutations
+//
+// Mutation streams can be applied candidate-by-candidate without materializing
+// the full input stream:
+//
+//	muts, _ := lql.ParseMutations([]string{`/state/status=running`}, time.Now())
+//	_ = lql.MutateStream(lql.MutateStreamRequest{
+//	  Reader: strings.NewReader(`{"state":{"status":"queued"}}`),
+//	  Ctx: context.Background(),
+//	  Writer: io.Discard, // optional compact NDJSON output sink
+//	  SpoolMemoryBytes: 1 << 20, // optional callback payload memory threshold
+//	  Mode: lql.MutateSingleObjectOnly,
+//	  Mutations: muts,
+//	  OnValue: func(v lql.MutateStreamValue) error {
+//	    // v.JSON/v.Value are in-memory when available.
+//	    // v.OpenJSON works for both in-memory and spooled payloads.
+//	    return nil
+//	  },
+//	})
 package lql
