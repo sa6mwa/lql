@@ -556,6 +556,32 @@ func TestQueryStreamMatchedOnlyInvokesCallbackForMatches(t *testing.T) {
 	}
 }
 
+func TestQueryStreamFastTopLevelEqEscapedKeyParity(t *testing.T) {
+	selector := mustParseQuerySelector(t, `/event="tabs_update"`)
+	input := []byte("{\"\\u0065vent\":\"tabs_update\"}\n{\"event\":\"other\"}")
+	assertQueryStreamParity(t, input, selector, true)
+}
+
+func TestQueryStreamFastTopLevelProgramEscapedKeyParity(t *testing.T) {
+	selector := mustParseQuerySelector(t, `/component="host",/event="tabs_update"`)
+	input := []byte("{\"\\u0063omponent\":\"host\",\"event\":\"tabs_update\"}\n{\"component\":\"host\",\"event\":\"other\"}")
+	assertQueryStreamParity(t, input, selector, true)
+}
+
+func TestQueryStreamFastTopLevelEqEarlyMatchStillValidatesRemainder(t *testing.T) {
+	selector := mustParseQuerySelector(t, `/event="tabs_update"`)
+	err := QueryStream(QueryStreamRequest{
+		Reader:   strings.NewReader(`{"event":"tabs_update","broken":[1,}`),
+		Selector: selector,
+		OnValue: func(QueryStreamValue) error {
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected parse error for invalid trailing object member")
+	}
+}
+
 func TestQueryStreamDisableInternalSpoolRequiresFactory(t *testing.T) {
 	err := QueryStream(QueryStreamRequest{
 		Reader:               strings.NewReader(`{"id":"a"}`),

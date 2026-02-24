@@ -13,6 +13,28 @@ JSON documents. This module includes:
 go get pkt.systems/lql@latest
 ```
 
+## Development Targets
+
+The repository provides smoke (fast) and full (expensive) validation targets:
+
+```bash
+make test                 # fast test pass
+make benchmark            # smoke benchmarks
+make benchmark-lockd      # lockd fixture benchmarks
+make benchmark-lockd-save # save lockd baseline under perf/baselines
+make fuzz                 # smoke fuzzers
+make test-all             # check + smoke fuzz + smoke bench
+
+make test-all-full        # full coverage + full fuzz + full bench
+make ci-lockd             # lockd CI profile (contracts + lockd benches)
+```
+
+For CPU-constrained systems, cap Go runtime parallelism for any target:
+
+```bash
+CPU_LIMIT=2 make test-all
+```
+
 ## Library usage
 
 ### Selectors
@@ -136,23 +158,52 @@ _ = lql.MutateStream(lql.MutateStreamRequest{
 ```
 
 `QueryStream` supports `QueryDecisionOnly` and `QueryDecisionPlusValue` modes,
-and both stream APIs return typed `*StreamError` values with machine-usable
-codes (`invalid_selector`, `invalid_body`, `document_too_large`,
-`context_canceled`, `internal`).
+and both stream APIs return typed `*StreamError` values for contract failures
+with machine-usable codes (`invalid_selector`, `invalid_body`,
+`document_too_large`, `context_canceled`, `internal`).
 Helper predicates are available:
 `IsStreamInvalidSelector`, `IsStreamInvalidBody`,
 `IsStreamDocumentTooLarge`, `IsStreamContextCanceled`, `IsStreamInternal`.
 
 Selector capability routing helpers are available via
-`InspectSelectorCapabilities`.
+`InspectSelectorCapabilities` and `InspectSelectorExecutionTraits`.
+
+For deterministic stream accounting and early-stop contracts, use
+`QueryStreamWithResult` and `MutateStreamWithResult`.
+`QueryStreamRequest` supports additive stop limits:
+`MaxMatches`, `MaxCandidates`, `MaxBytesRead`.
+`QueryStreamWithResult` reports:
+`CandidatesSeen`, `CandidatesMatched`, `BytesRead`, `BytesCaptured`,
+`SpillCount`, `SpillBytes`, `StoppedEarly`, `StopReason`, `LastOffset`.
+`MutateStreamWithResult` reports:
+`CandidatesSeen`, `CandidatesWritten`, `BytesRead`, `BytesWritten`,
+`BytesCaptured`, `SpillCount`, `SpillBytes`,
+`StoppedEarly`, `StopReason`, `LastOffset`.
+
+`QueryStreamRequest.OnDecision` runs once per candidate before `OnValue` and
+still fires when `MatchedOnly=true` and value callbacks are skipped.
+Return `ErrStreamStop` (or wrapping it) from stream callbacks for graceful
+callback-driven stop (`StoppedEarly=true`, stop reason `callback_stop`,
+`nil` error return).
 
 In `QueryDecisionPlusValue`/`IncludeJSON` mode, candidate payloads spool in
-memory up to 5 MiB by default, then spill to temp files (`/tmp` by default).
+memory up to 3 MiB by default, then spill to temp files (`/tmp` by default).
 Configure with `SpoolMemoryBytes`, `SpoolTempDir`, and `SpoolFilePattern`.
 Set `MatchedOnly` to invoke callbacks only for matched candidates.
+Tune capture behavior with `CapturePolicy`:
+`QueryCaptureAllCandidates` (default) or
+`QueryCaptureMatchesOnlyBestEffort` for lower spool pressure on low-hit scans.
 
 For caller-managed payload storage, set `DisableInternalSpool=true` and provide
 `PayloadSinkFactory` with a custom `QueryStreamPayloadSink`.
+For low-churn spill reuse across many candidates, use
+`NewReusableQueryPayloadSinkFactory(...)` and pass `factory.Factory()` as the
+payload sink factory, then call `factory.Close()` when done.
+
+`MutateStream` callback payload capture also supports caller-managed sinks via
+`DisableInternalSpool` and `PayloadSinkFactory`. For reusable spill behavior,
+use `NewReusableMutatePayloadSinkFactory(...)` and pass `factory.Factory()`,
+then call `factory.Close()` when done.
 
 `MutateStream` supports strict framing/root modes:
 `MutateSingleValueOnly`, `MutateObjectRootOnly`, and

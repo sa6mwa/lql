@@ -1,0 +1,14 @@
+goos: linux
+goarch: amd64
+pkg: pkt.systems/lql
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkLockdFixtures/stash_jsonl/query_only/decision_plan/warmup_included-12         	       1	  62433885 ns/op	   70472 B/op	      12 allocs/op
+BenchmarkLockdFixtures/stash_jsonl/query_only/decision_plan/steady_state-12            	       1	  57080985 ns/op	   65632 B/op	       2 allocs/op
+BenchmarkLockdFixtures/stash_jsonl/query_to_mutate_handoff/reusable_sink/warmup_included-12         	       1	  93427015 ns/op	  154800 B/op	      74 allocs/op
+BenchmarkLockdFixtures/stash_jsonl/query_to_mutate_handoff/reusable_sink/steady_state-12            	       1	  93313716 ns/op	  133032 B/op	      38 allocs/op
+BenchmarkLockdFixtures/stash_pretty_stream/query_only/decision_plan/warmup_included-12              	       1	  73595662 ns/op	   70472 B/op	      12 allocs/op
+BenchmarkLockdFixtures/stash_pretty_stream/query_only/decision_plan/steady_state-12                 	       1	  73924043 ns/op	   65632 B/op	       2 allocs/op
+BenchmarkLockdFixtures/stash_pretty_stream/query_to_mutate_handoff/reusable_sink/warmup_included-12 	       1	 126341761 ns/op	  153888 B/op	      68 allocs/op
+BenchmarkLockdFixtures/stash_pretty_stream/query_to_mutate_handoff/reusable_sink/steady_state-12    	       1	 117875738 ns/op	  133032 B/op	      38 allocs/op
+PASS
+ok  	pkt.systems/lql	1.079s

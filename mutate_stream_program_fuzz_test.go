@@ -91,4 +91,3 @@ func synthesizeMutationProgram(seed []byte) []string {
 	}
 	return out
 }
-

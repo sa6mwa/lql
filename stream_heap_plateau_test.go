@@ -64,6 +64,47 @@ func TestQueryStreamHeapPlateauDecisionOnlyPlan(t *testing.T) {
 	})
 }
 
+func TestQueryStreamHeapPlateauDecisionOnlyPlanWithStopControls(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heap plateau test in short mode")
+	}
+	payload, err := buildQueryNDJSONPayload(2048, 96)
+	if err != nil {
+		t.Fatalf("build query payload: %v", err)
+	}
+	selector, err := ParseSelectorString(`/status="open"`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	plan, err := NewQueryStreamPlan(selector)
+	if err != nil {
+		t.Fatalf("new query plan: %v", err)
+	}
+	var src bytes.Reader
+	reader := bufio.NewReaderSize(&src, 64*1024)
+
+	assertHeapPlateau(t, heapPlateauConfig{
+		warmup:             4,
+		checkpoints:        8,
+		batchRuns:          20,
+		maxAllocSpread:     512 * 1024,
+		maxObjectSpread:    6000,
+		maxAllocTailDelta:  256 * 1024,
+		maxObjectTailDelta: 2500,
+	}, func() error {
+		src.Reset(payload)
+		reader.Reset(&src)
+		_, err := QueryStreamWithResult(QueryStreamRequest{
+			Reader:        reader,
+			Plan:          plan,
+			Mode:          QueryDecisionOnly,
+			MaxCandidates: 256,
+			OnDecision:    func(QueryStreamDecision) error { return nil },
+		})
+		return err
+	})
+}
+
 func TestQueryStreamHeapPlateauPlusValueSpool(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping heap plateau test in short mode")
@@ -124,6 +165,41 @@ func TestQueryStreamHeapPlateauPlusValueSpool(t *testing.T) {
 			SpoolMemoryBytes: spoolMem,
 			OnValue:          onValue,
 		})
+	})
+}
+
+func TestQueryStreamHeapPlateauPlusValueBestEffortCapture(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heap plateau test in short mode")
+	}
+	payload := buildLowMatchCapturePayload(192, 8*1024)
+	selector, err := ParseSelectorString(`/id="match"`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	var src bytes.Reader
+	reader := bufio.NewReaderSize(&src, 64*1024)
+
+	assertHeapPlateau(t, heapPlateauConfig{
+		warmup:             4,
+		checkpoints:        8,
+		batchRuns:          8,
+		maxAllocSpread:     1024 * 1024,
+		maxObjectSpread:    10000,
+		maxAllocTailDelta:  512 * 1024,
+		maxObjectTailDelta: 4000,
+	}, func() error {
+		src.Reset(payload)
+		reader.Reset(&src)
+		_, err := QueryStreamWithResult(QueryStreamRequest{
+			Reader:        reader,
+			Selector:      selector,
+			Mode:          QueryDecisionPlusValue,
+			MatchedOnly:   true,
+			CapturePolicy: QueryCaptureMatchesOnlyBestEffort,
+			OnValue:       func(QueryStreamValue) error { return nil },
+		})
+		return err
 	})
 }
 

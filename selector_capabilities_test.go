@@ -44,3 +44,36 @@ func TestInspectSelectorCapabilitiesEmpty(t *testing.T) {
 		t.Fatalf("expected no path complexity for empty selector: %+v", capabilities)
 	}
 }
+
+func TestInspectSelectorExecutionTraits(t *testing.T) {
+	selector, err := ParseSelectorString(`and.eq{field=/status,value=open},icontains{field=/msg,value=timeout},exists{/meta/**/etag}`)
+	if err != nil {
+		t.Fatalf("ParseSelectorString: %v", err)
+	}
+	traits := InspectSelectorExecutionTraits(selector)
+	if !traits.UsesContainsLike {
+		t.Fatalf("expected contains-like trait")
+	}
+	if !traits.UsesRecursivePath {
+		t.Fatalf("expected recursive-path trait")
+	}
+	if !traits.UsesWildcardPath {
+		t.Fatalf("expected wildcard-path trait")
+	}
+	if !traits.RequiresObjectRoot {
+		t.Fatalf("expected object-root requirement")
+	}
+	if traits.EarlyNonMatchLikely {
+		t.Fatalf("expected conservative early-non-match=false for recursive contains selectors")
+	}
+}
+
+func TestInspectSelectorExecutionTraitsEmptySelector(t *testing.T) {
+	traits := InspectSelectorExecutionTraits(Selector{})
+	if traits.RequiresObjectRoot {
+		t.Fatalf("expected empty selector to allow non-object roots")
+	}
+	if traits.EarlyNonMatchLikely {
+		t.Fatalf("expected no early non-match heuristic for empty selector")
+	}
+}

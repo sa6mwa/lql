@@ -25,6 +25,30 @@ var (
 
 const defaultMutateStreamSpoolMemoryBytes = 1 * 1024 * 1024
 
+// MutateStreamStopReason classifies graceful early-stop outcomes.
+type MutateStreamStopReason string
+
+const (
+	// MutateStreamStopNone indicates normal end-of-stream completion.
+	MutateStreamStopNone MutateStreamStopReason = ""
+	// MutateStreamStopCallbackStop indicates callback requested graceful stop.
+	MutateStreamStopCallbackStop MutateStreamStopReason = "callback_stop"
+)
+
+// MutateStreamResult reports deterministic run summary for MutateStream.
+type MutateStreamResult struct {
+	CandidatesSeen    int64
+	CandidatesWritten int64
+	BytesRead         int64
+	BytesWritten      int64
+	BytesCaptured     int64
+	SpillCount        int64
+	SpillBytes        int64
+	StoppedEarly      bool
+	StopReason        MutateStreamStopReason
+	LastOffset        int64
+}
+
 // MutateStreamRequest configures streaming mutation evaluation.
 type MutateStreamRequest struct {
 	Ctx    context.Context
@@ -44,12 +68,36 @@ type MutateStreamRequest struct {
 	// SpoolFilePattern controls os.CreateTemp naming for spilled callback payloads.
 	// Empty defaults to "lql-spool-*.json".
 	SpoolFilePattern string
+	// DisableInternalSpool requires caller-managed payload sink when callback
+	// capture is enabled.
+	DisableInternalSpool bool
+	// PayloadSinkFactory creates a candidate payload sink for caller-managed
+	// callback capture.
+	PayloadSinkFactory MutateStreamPayloadSinkFactory
 	// MaxCandidateBytes is measured on canonical emitted candidate bytes
 	// (compact JSON form after mutation for object roots) from the first
 	// non-whitespace byte to closing token.
 	MaxCandidateBytes int64
 	OnValue           func(MutateStreamValue) error
 }
+
+// MutateStreamPayloadSink receives candidate payload bytes in callback mode.
+type MutateStreamPayloadSink interface {
+	io.Writer
+	Finalize() error
+	Open() (io.ReadCloser, error)
+	Bytes() []byte
+	SizeHint() int
+	Cleanup() error
+}
+
+// MutateStreamPayloadSinkRequest describes one candidate sink allocation.
+type MutateStreamPayloadSinkRequest struct {
+	Offset int64
+}
+
+// MutateStreamPayloadSinkFactory creates per-candidate payload sinks.
+type MutateStreamPayloadSinkFactory func(MutateStreamPayloadSinkRequest) (MutateStreamPayloadSink, error)
 
 // MutateStreamValue describes one mutated candidate value from the stream.
 // JSON, Value, and OpenJSON are valid only during callback invocation.
@@ -90,18 +138,26 @@ func NewMutateStreamPlan(mutations []Mutation) (MutateStreamPlan, error) {
 	return MutateStreamPlan{template: program}, nil
 }
 
-// MutateStream applies mutations to JSON values from a stream and emits values
-// in deterministic input order. Top-level arrays are treated as streams of
-// candidate values (including nested top-level arrays).
-func MutateStream(req MutateStreamRequest) (err error) {
+// MutateStreamWithResult applies mutations to JSON values from a stream and
+// emits values in deterministic input order. Top-level arrays are treated as
+// streams of candidate values (including nested top-level arrays).
+func MutateStreamWithResult(req MutateStreamRequest) (result MutateStreamResult, err error) {
+	result = MutateStreamResult{LastOffset: -1}
 	if req.Reader == nil {
-		return &StreamError{Code: StreamErrorInvalidBody, Detail: "mutate stream reader required", Offset: -1}
+		return result, &StreamError{Code: StreamErrorInvalidBody, Detail: "mutate stream reader required", Offset: -1}
 	}
 	if req.OnValue == nil && req.Writer == nil {
-		return &StreamError{Code: StreamErrorInvalidBody, Detail: "mutate stream callback or writer required", Offset: -1}
+		return result, &StreamError{Code: StreamErrorInvalidBody, Detail: "mutate stream callback or writer required", Offset: -1}
+	}
+	if req.OnValue != nil && req.DisableInternalSpool && req.PayloadSinkFactory == nil {
+		return result, &StreamError{
+			Code:   StreamErrorInvalidBody,
+			Detail: "mutate stream caller spool requested but payload sink factory is nil",
+			Offset: -1,
+		}
 	}
 	if !req.Plan.IsZero() && len(req.Mutations) > 0 {
-		return &StreamError{
+		return result, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: "mutate stream request must set either mutations or plan, not both",
 			Offset: -1,
@@ -110,7 +166,7 @@ func MutateStream(req MutateStreamRequest) (err error) {
 	switch req.Mode {
 	case MutateModeAuto, MutateSingleValueOnly, MutateObjectRootOnly, MutateSingleObjectOnly:
 	default:
-		return &StreamError{
+		return result, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: fmt.Sprintf("unknown mutate stream mode %d", req.Mode),
 			Offset: -1,
@@ -119,6 +175,7 @@ func MutateStream(req MutateStreamRequest) (err error) {
 
 	state := acquireMutateStreamState()
 	state.reset(req)
+	state.result = result
 	defer func() {
 		cleanupErr := state.candidateSink.cleanupCandidate()
 		if cleanupErr != nil && err == nil {
@@ -136,11 +193,12 @@ func MutateStream(req MutateStreamRequest) (err error) {
 		if cleanupErr != nil {
 			_ = state.candidateSink.releaseAll()
 		}
+		result = state.result
 		releaseMutateStreamState(state)
 	}()
 	if !req.Plan.IsZero() {
 		if req.Plan.template == nil {
-			return &StreamError{
+			return result, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "mutate stream plan is invalid",
 				Offset: -1,
@@ -152,7 +210,7 @@ func MutateStream(req MutateStreamRequest) (err error) {
 	} else if len(req.Mutations) > 0 {
 		state.requiresMutation = true
 		if err := state.compileMutationProgram(req.Mutations); err != nil {
-			return &StreamError{
+			return result, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "invalid mutation program",
 				Offset: -1,
@@ -161,41 +219,60 @@ func MutateStream(req MutateStreamRequest) (err error) {
 		}
 	}
 
-	bufReader, ok := req.Reader.(*bufio.Reader)
-	if !ok {
-		bufReader = bufio.NewReaderSize(req.Reader, 64*1024)
+	if buffered, ok := req.Reader.(*bufio.Reader); ok {
+		state.readerStorage.Reset(state.ctx, buffered)
+	} else {
+		if state.bufferedReader == nil {
+			state.bufferedReader = bufio.NewReaderSize(req.Reader, 64*1024)
+		} else {
+			state.bufferedReader.Reset(req.Reader)
+		}
+		state.readerStorage.Reset(state.ctx, state.bufferedReader)
 	}
-	state.reader = newStreamByteReader(state.ctx, bufReader)
+	state.reader = &state.readerStorage
 	for {
 		start, err := readNonSpaceByte(state.reader)
 		if err != nil {
 			if err == io.EOF {
 				if state.requiresSingleTopLevelValue() && state.seenTopLevel == 0 {
-					return &StreamError{Code: StreamErrorInvalidBody, Detail: "mutate stream mode requires exactly one top-level JSON value", Offset: -1}
+					return result, &StreamError{Code: StreamErrorInvalidBody, Detail: "mutate stream mode requires exactly one top-level JSON value", Offset: -1}
 				}
-				return nil
+				state.result.LastOffset = state.reader.Offset()
+				state.result.BytesRead = state.reader.Offset()
+				return state.result, nil
 			}
-			return state.wrapStreamError(err, state.reader.Offset())
+			return result, state.wrapStreamError(err, state.reader.Offset())
 		}
 		if state.requiresSingleTopLevelValue() && state.seenTopLevel > 0 {
-			return &StreamError{
+			return result, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "mutate stream mode requires exactly one top-level JSON value",
 				Offset: state.reader.Offset() - 1,
 			}
 		}
 		if state.requiresObjectRoot() && start != '{' {
-			return &StreamError{
+			return result, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "mutate stream mode requires top-level JSON object root",
 				Offset: state.reader.Offset() - 1,
 			}
 		}
 		if err := state.consumeCandidate(start); err != nil {
-			return err
+			return result, err
 		}
 		state.seenTopLevel++
+		if state.stopRequested {
+			return state.result, nil
+		}
 	}
+}
+
+// MutateStream applies mutations to JSON values from a stream and emits values
+// in deterministic input order. Top-level arrays are treated as streams of
+// candidate values (including nested top-level arrays).
+func MutateStream(req MutateStreamRequest) error {
+	_, err := MutateStreamWithResult(req)
+	return err
 }
 
 var mutateStreamStatePool = sync.Pool{
@@ -216,14 +293,18 @@ func releaseMutateStreamState(state *mutateStreamState) {
 	if state == nil {
 		return
 	}
+	_ = state.candidateSink.releaseAll()
 	state.ctx = nil
 	state.reader = nil
+	state.readerStorage = streamByteReader{}
 	state.onValue = nil
 	state.writer = nil
 	state.mode = MutateModeAuto
 	state.maxCandidateSize = 0
 	state.spoolCfg = streamSpoolConfig{}
 	state.seenTopLevel = 0
+	state.disableSpool = false
+	state.payloadSinkMaker = nil
 	state.requiresMutation = false
 	state.compiled = nil
 	state.rootRules = nil
@@ -235,6 +316,8 @@ func releaseMutateStreamState(state *mutateStreamState) {
 	state.path = state.path[:0]
 	state.keyBytes = state.keyBytes[:0]
 	state.openJSON = nil
+	state.result = MutateStreamResult{}
+	state.stopRequested = false
 	for i := range state.missingCache {
 		state.missingCache[i].rules = state.missingCache[i].rules[:0]
 		state.missingCache[i].payload = state.missingCache[i].payload[:0]
@@ -256,12 +339,16 @@ func releaseMutateStreamState(state *mutateStreamState) {
 type mutateStreamState struct {
 	ctx              context.Context
 	reader           *streamByteReader
+	readerStorage    streamByteReader
+	bufferedReader   *bufio.Reader
 	onValue          func(MutateStreamValue) error
 	writer           io.Writer
 	mode             MutateStreamMode
 	maxCandidateSize int64
 	spoolCfg         streamSpoolConfig
 	seenTopLevel     int64
+	disableSpool     bool
+	payloadSinkMaker MutateStreamPayloadSinkFactory
 
 	requiresMutation bool
 	compiled         []compiledStreamMutation
@@ -277,6 +364,8 @@ type mutateStreamState struct {
 
 	candidateSink mutateCandidateSink
 	openJSON      func() (io.ReadCloser, error)
+	result        MutateStreamResult
+	stopRequested bool
 
 	missingCache []mutateMissingCacheEntry
 }
@@ -302,6 +391,8 @@ func (s *mutateStreamState) reset(req MutateStreamRequest) {
 	s.maxCandidateSize = req.MaxCandidateBytes
 	s.spoolCfg = normalizeMutateStreamSpoolConfig(req.SpoolMemoryBytes, req.SpoolTempDir, req.SpoolFilePattern)
 	s.seenTopLevel = 0
+	s.disableSpool = req.DisableInternalSpool
+	s.payloadSinkMaker = req.PayloadSinkFactory
 	s.requiresMutation = false
 	s.compiled = nil
 	s.rootRules = nil
@@ -313,6 +404,8 @@ func (s *mutateStreamState) reset(req MutateStreamRequest) {
 	s.path = s.path[:0]
 	s.keyBytes = s.keyBytes[:0]
 	s.openJSON = s.openCurrentPayload
+	s.result = MutateStreamResult{LastOffset: -1}
+	s.stopRequested = false
 	for i := range s.missingCache {
 		s.missingCache[i].rules = s.missingCache[i].rules[:0]
 		s.missingCache[i].payload = s.missingCache[i].payload[:0]
@@ -435,7 +528,18 @@ func (s *mutateStreamState) consumeCandidate(start byte) (err error) {
 	}
 
 	sink := &s.candidateSink
-	sink.reset(s.writer, s.onValue != nil, s.maxCandidateSize, s.candidateHint, s.spoolCfg)
+	if err := sink.reset(
+		s.writer,
+		s.onValue != nil,
+		s.maxCandidateSize,
+		s.candidateHint,
+		s.spoolCfg,
+		s.disableSpool,
+		s.payloadSinkMaker,
+		candidateStart,
+	); err != nil {
+		return s.wrapStreamError(err, s.reader.Offset())
+	}
 	defer func() {
 		cleanupErr := sink.cleanupCandidate()
 		if cleanupErr != nil && err == nil {
@@ -465,6 +569,12 @@ func (s *mutateStreamState) consumeCandidate(start byte) (err error) {
 	}
 
 	size := sink.size
+	s.result.CandidatesSeen++
+	s.result.LastOffset = s.reader.Offset()
+	s.result.BytesRead = s.reader.Offset()
+	s.result.BytesCaptured += sink.capturedBytes()
+	s.result.SpillCount += sink.spillCount()
+	s.result.SpillBytes += sink.spillBytes()
 	if s.onValue != nil {
 		if err := sink.finalizeCapture(); err != nil {
 			return s.wrapStreamError(err, s.reader.Offset())
@@ -477,8 +587,16 @@ func (s *mutateStreamState) consumeCandidate(start byte) (err error) {
 			Size:     size,
 			Offset:   candidateStart,
 		}); err != nil {
-			return s.wrapStreamError(err, s.reader.Offset())
+			if errors.Is(err, ErrStreamStop) {
+				s.stop(MutateStreamStopCallbackStop)
+			} else {
+				return err
+			}
 		}
+	}
+	s.result.CandidatesWritten++
+	if s.writer != nil {
+		s.result.BytesWritten += size + int64(len(jsonNewline))
 	}
 	if sizeHint := sink.sizeHint(); sizeHint > 0 {
 		s.candidateHint = sizeHint
@@ -542,6 +660,9 @@ func (s *mutateStreamState) consumeTopArray() error {
 		if err := s.consumeCandidate(start); err != nil {
 			return err
 		}
+		if s.stopRequested {
+			return nil
+		}
 		next, err := readNonSpaceByte(s.reader)
 		if err != nil {
 			return err
@@ -558,6 +679,12 @@ func (s *mutateStreamState) consumeTopArray() error {
 			return fmt.Errorf("expected ',' or ']' in top-level array, got %q", next)
 		}
 	}
+}
+
+func (s *mutateStreamState) stop(reason MutateStreamStopReason) {
+	s.stopRequested = true
+	s.result.StoppedEarly = true
+	s.result.StopReason = reason
 }
 
 func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, out mutateByteWriter) error {
@@ -1879,14 +2006,16 @@ func (e *mutateCandidateTooLargeError) Error() string {
 }
 
 type mutateCandidateSink struct {
-	writer    io.Writer
-	capture   bool
-	size      int64
-	max       int64
-	oneByte   [1]byte
-	spoolCfg  streamSpoolConfig
-	spool     streamCandidateSpool
-	spoolInit bool
+	writer      io.Writer
+	capture     bool
+	size        int64
+	max         int64
+	oneByte     [1]byte
+	spoolCfg    streamSpoolConfig
+	spool       streamCandidateSpool
+	spoolInit   bool
+	payloadSink MutateStreamPayloadSink
+	internal    bool
 }
 
 type mutateDiscardWriter struct{}
@@ -1899,12 +2028,37 @@ func (mutateDiscardWriter) WriteByte(byte) error {
 	return nil
 }
 
-func (s *mutateCandidateSink) reset(writer io.Writer, capture bool, max int64, hint int, cfg streamSpoolConfig) {
+func (s *mutateCandidateSink) reset(
+	writer io.Writer,
+	capture bool,
+	max int64,
+	hint int,
+	cfg streamSpoolConfig,
+	disableInternal bool,
+	payloadSinkFactory MutateStreamPayloadSinkFactory,
+	offset int64,
+) error {
 	s.writer = writer
 	s.capture = capture
 	s.max = max
 	s.size = 0
+	s.payloadSink = nil
+	s.internal = false
 	if s.capture {
+		if payloadSinkFactory != nil {
+			payload, err := payloadSinkFactory(MutateStreamPayloadSinkRequest{Offset: offset})
+			if err != nil {
+				return err
+			}
+			if payload == nil {
+				return fmt.Errorf("mutate payload sink factory returned nil")
+			}
+			s.payloadSink = payload
+			return nil
+		}
+		if disableInternal {
+			return fmt.Errorf("mutate payload sink required when internal spool is disabled")
+		}
 		s.spoolCfg = cfg
 		if !s.spoolInit {
 			s.spool = streamCandidateSpool{
@@ -1915,49 +2069,144 @@ func (s *mutateCandidateSink) reset(writer io.Writer, capture bool, max int64, h
 		} else {
 			s.spool.resetForCandidate(cfg, hint)
 		}
-		return
+		s.internal = true
+		return nil
 	}
+	return nil
 }
 
 func (s *mutateCandidateSink) payload() []byte {
-	if !s.capture || !s.spoolInit {
+	if !s.capture {
 		return nil
 	}
-	return s.spool.PayloadBytes()
+	if s.internal {
+		if !s.spoolInit {
+			return nil
+		}
+		return s.spool.PayloadBytes()
+	}
+	if s.payloadSink == nil {
+		return nil
+	}
+	return s.payloadSink.Bytes()
 }
 
 func (s *mutateCandidateSink) openJSON() (io.ReadCloser, error) {
-	if !s.capture || !s.spoolInit {
+	if !s.capture {
 		return nil, fmt.Errorf("mutate stream candidate payload unavailable")
 	}
-	return s.spool.Open()
+	if s.internal {
+		if !s.spoolInit {
+			return nil, fmt.Errorf("mutate stream candidate payload unavailable")
+		}
+		return s.spool.Open()
+	}
+	if s.payloadSink == nil {
+		return nil, fmt.Errorf("mutate stream candidate payload unavailable")
+	}
+	return s.payloadSink.Open()
 }
 
 func (s *mutateCandidateSink) finalizeCapture() error {
-	if !s.capture || !s.spoolInit {
+	if !s.capture {
 		return nil
 	}
-	return s.spool.Finalize()
+	if s.internal {
+		if !s.spoolInit {
+			return nil
+		}
+		return s.spool.Finalize()
+	}
+	if s.payloadSink == nil {
+		return nil
+	}
+	return s.payloadSink.Finalize()
 }
 
 func (s *mutateCandidateSink) sizeHint() int {
-	if !s.capture || !s.spoolInit {
+	if !s.capture {
 		return 0
 	}
-	return s.spool.SizeHint()
+	if s.internal {
+		if !s.spoolInit {
+			return 0
+		}
+		return s.spool.SizeHint()
+	}
+	if s.payloadSink == nil {
+		return 0
+	}
+	return s.payloadSink.SizeHint()
+}
+
+func (s *mutateCandidateSink) capturedBytes() int64 {
+	if !s.capture {
+		return 0
+	}
+	if s.internal {
+		if !s.spoolInit {
+			return 0
+		}
+		return s.spool.Size()
+	}
+	if stats, ok := s.payloadSink.(interface{ CapturedBytes() int64 }); ok {
+		return stats.CapturedBytes()
+	}
+	return 0
+}
+
+func (s *mutateCandidateSink) spillCount() int64 {
+	if !s.capture {
+		return 0
+	}
+	if s.internal {
+		if !s.spoolInit {
+			return 0
+		}
+		return s.spool.SpillCount()
+	}
+	if stats, ok := s.payloadSink.(interface{ SpillCount() int64 }); ok {
+		return stats.SpillCount()
+	}
+	return 0
+}
+
+func (s *mutateCandidateSink) spillBytes() int64 {
+	if !s.capture {
+		return 0
+	}
+	if s.internal {
+		if !s.spoolInit {
+			return 0
+		}
+		return s.spool.SpillBytes()
+	}
+	if stats, ok := s.payloadSink.(interface{ SpillBytes() int64 }); ok {
+		return stats.SpillBytes()
+	}
+	return 0
 }
 
 func (s *mutateCandidateSink) cleanupCandidate() error {
 	var firstErr error
-	if s.capture && s.spoolInit {
-		if err := s.spool.cleanup(false); err != nil {
-			firstErr = err
+	if s.capture {
+		if s.internal && s.spoolInit {
+			if err := s.spool.cleanup(false); err != nil {
+				firstErr = err
+			}
+		}
+		if !s.internal && s.payloadSink != nil {
+			if err := s.payloadSink.Cleanup(); err != nil {
+				firstErr = err
+			}
 		}
 	}
 	s.writer = nil
 	s.capture = false
 	s.size = 0
 	s.max = 0
+	s.payloadSink = nil
+	s.internal = false
 	return firstErr
 }
 
@@ -1973,6 +2222,8 @@ func (s *mutateCandidateSink) releaseAll() error {
 	s.capture = false
 	s.size = 0
 	s.max = 0
+	s.payloadSink = nil
+	s.internal = false
 	return firstErr
 }
 
@@ -1985,7 +2236,17 @@ func (s *mutateCandidateSink) Write(p []byte) (int, error) {
 		return 0, &mutateCandidateTooLargeError{size: next, max: s.max}
 	}
 	if s.capture {
-		n, err := s.spool.Write(p)
+		var (
+			n   int
+			err error
+		)
+		if s.internal {
+			n, err = s.spool.Write(p)
+		} else if s.payloadSink != nil {
+			n, err = s.payloadSink.Write(p)
+		} else {
+			return 0, fmt.Errorf("mutate stream payload sink unavailable")
+		}
 		if err != nil {
 			return n, err
 		}

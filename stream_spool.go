@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 )
 
 const (
@@ -41,13 +42,34 @@ func normalizeStreamSpoolConfig(memoryBytes int64, tempDir, pattern string) stre
 }
 
 type streamCandidateSpool struct {
-	cfg      streamSpoolConfig
-	mem      []byte
-	file     *os.File
-	fileBuf  *bufio.Writer
-	filePath string
-	size     int64
-	oneByte  [1]byte
+	cfg        streamSpoolConfig
+	mem        []byte
+	file       *os.File
+	fileBuf    *bufio.Writer
+	filePath   string
+	spilled    bool
+	size       int64
+	spillCount int64
+	spillBytes int64
+	oneByte    [1]byte
+}
+
+var streamCandidateSpoolPool sync.Pool
+
+func acquireStreamCandidateSpool(cfg streamSpoolConfig, hint int) *streamCandidateSpool {
+	if value := streamCandidateSpoolPool.Get(); value != nil {
+		spool := value.(*streamCandidateSpool)
+		spool.resetForCandidate(cfg, hint)
+		return spool
+	}
+	return newStreamCandidateSpool(cfg, hint)
+}
+
+func releaseStreamCandidateSpool(spool *streamCandidateSpool) {
+	if spool == nil {
+		return
+	}
+	streamCandidateSpoolPool.Put(spool)
 }
 
 func newStreamCandidateSpool(cfg streamSpoolConfig, hint int) *streamCandidateSpool {
@@ -70,8 +92,23 @@ func acquireSpoolMem(cfg streamSpoolConfig, hint int) []byte {
 }
 
 func (s *streamCandidateSpool) resetForCandidate(cfg streamSpoolConfig, hint int) {
+	if s.file != nil && (s.cfg.tempDir != cfg.tempDir || s.cfg.filePattern != cfg.filePattern) {
+		if s.fileBuf != nil {
+			_ = s.fileBuf.Flush()
+			s.fileBuf = nil
+		}
+		_ = s.file.Close()
+		if s.filePath != "" {
+			_ = os.Remove(s.filePath)
+		}
+		s.file = nil
+		s.filePath = ""
+	}
 	s.cfg = cfg
+	s.spilled = false
 	s.size = 0
+	s.spillCount = 0
+	s.spillBytes = 0
 	if s.mem == nil {
 		s.mem = acquireSpoolMem(cfg, hint)
 		return
@@ -88,7 +125,7 @@ func (s *streamCandidateSpool) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if s.file == nil {
+	if !s.spilled {
 		next := int64(len(s.mem) + len(p))
 		if next <= s.cfg.memoryBytes {
 			if err := s.ensureMemCapacity(int(next)); err != nil {
@@ -112,6 +149,7 @@ func (s *streamCandidateSpool) Write(p []byte) (int, error) {
 		n, err = s.file.Write(p)
 	}
 	s.size += int64(n)
+	s.spillBytes += int64(n)
 	if err != nil {
 		return n, err
 	}
@@ -122,7 +160,7 @@ func (s *streamCandidateSpool) Write(p []byte) (int, error) {
 }
 
 func (s *streamCandidateSpool) WriteByte(b byte) error {
-	if s.file == nil {
+	if !s.spilled {
 		next := int64(len(s.mem) + 1)
 		if next <= s.cfg.memoryBytes {
 			if err := s.ensureMemCapacity(int(next)); err != nil {
@@ -141,11 +179,13 @@ func (s *streamCandidateSpool) WriteByte(b byte) error {
 			return err
 		}
 		s.size++
+		s.spillBytes++
 		return nil
 	}
 	s.oneByte[0] = b
 	n, err := s.file.Write(s.oneByte[:])
 	s.size += int64(n)
+	s.spillBytes += int64(n)
 	if err != nil {
 		return err
 	}
@@ -156,37 +196,58 @@ func (s *streamCandidateSpool) WriteByte(b byte) error {
 }
 
 func (s *streamCandidateSpool) spillToDisk() error {
-	file, err := os.CreateTemp(s.cfg.tempDir, s.cfg.filePattern)
-	if err != nil {
-		return fmt.Errorf("create spool file: %w", err)
-	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-		return fmt.Errorf("chmod spool file: %w", err)
-	}
-	if s.fileBuf == nil {
-		s.fileBuf = bufio.NewWriterSize(file, 64*1024)
+	if s.file == nil {
+		file, err := os.CreateTemp(s.cfg.tempDir, s.cfg.filePattern)
+		if err != nil {
+			return fmt.Errorf("create spool file: %w", err)
+		}
+		if err := file.Chmod(0o600); err != nil {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+			return fmt.Errorf("chmod spool file: %w", err)
+		}
+		s.file = file
+		s.filePath = file.Name()
+		if s.fileBuf == nil {
+			s.fileBuf = bufio.NewWriterSize(file, 64*1024)
+		} else {
+			s.fileBuf.Reset(file)
+		}
 	} else {
-		s.fileBuf.Reset(file)
+		if err := s.file.Truncate(0); err != nil {
+			return fmt.Errorf("truncate spool file: %w", err)
+		}
+		if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("seek spool file: %w", err)
+		}
+		if s.fileBuf == nil {
+			s.fileBuf = bufio.NewWriterSize(s.file, 64*1024)
+		} else {
+			s.fileBuf.Reset(s.file)
+		}
 	}
 	if len(s.mem) > 0 {
 		n, err := s.fileBuf.Write(s.mem)
 		if err != nil {
-			_ = file.Close()
-			_ = os.Remove(file.Name())
+			_ = s.file.Close()
+			_ = os.Remove(s.filePath)
+			s.file = nil
+			s.filePath = ""
 			return fmt.Errorf("write spool file: %w", err)
 		}
 		if n != len(s.mem) {
-			_ = file.Close()
-			_ = os.Remove(file.Name())
+			_ = s.file.Close()
+			_ = os.Remove(s.filePath)
+			s.file = nil
+			s.filePath = ""
 			return io.ErrShortWrite
 		}
+		s.spillBytes += int64(n)
 		streamJSONBytePool.release(s.mem)
 		s.mem = nil
 	}
-	s.file = file
-	s.filePath = file.Name()
+	s.spilled = true
+	s.spillCount++
 	return nil
 }
 
@@ -227,7 +288,7 @@ func (s *streamCandidateSpool) ensureMemCapacity(next int) error {
 }
 
 func (s *streamCandidateSpool) PayloadBytes() []byte {
-	if s.file != nil {
+	if s.spilled {
 		return nil
 	}
 	return s.mem
@@ -237,8 +298,11 @@ func (s *streamCandidateSpool) Open() (io.ReadCloser, error) {
 	if err := s.Finalize(); err != nil {
 		return nil, err
 	}
-	if s.file == nil {
+	if !s.spilled {
 		return io.NopCloser(bytes.NewReader(s.mem)), nil
+	}
+	if s.file == nil {
+		return nil, fmt.Errorf("spool file unavailable")
 	}
 	f, err := os.Open(s.filePath)
 	if err != nil {
@@ -248,7 +312,7 @@ func (s *streamCandidateSpool) Open() (io.ReadCloser, error) {
 }
 
 func (s *streamCandidateSpool) Finalize() error {
-	if s.fileBuf == nil {
+	if !s.spilled || s.fileBuf == nil {
 		return nil
 	}
 	return s.fileBuf.Flush()
@@ -256,6 +320,14 @@ func (s *streamCandidateSpool) Finalize() error {
 
 func (s *streamCandidateSpool) Size() int64 {
 	return s.size
+}
+
+func (s *streamCandidateSpool) SpillCount() int64 {
+	return s.spillCount
+}
+
+func (s *streamCandidateSpool) SpillBytes() int64 {
+	return s.spillBytes
 }
 
 func (s *streamCandidateSpool) SizeHint() int {
@@ -275,32 +347,40 @@ func (s *streamCandidateSpool) Cleanup() error {
 func (s *streamCandidateSpool) cleanup(releaseMem bool) error {
 	var firstErr error
 	if s.file != nil {
-		if s.fileBuf != nil {
-			if err := s.fileBuf.Flush(); err != nil && firstErr == nil {
+		if releaseMem {
+			if s.fileBuf != nil {
+				if err := s.fileBuf.Flush(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if err := s.file.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
-			if releaseMem {
-				s.fileBuf = nil
-			} else {
-				s.fileBuf.Reset(io.Discard)
+			if err := os.Remove(s.filePath); err != nil && !os.IsNotExist(err) && firstErr == nil {
+				firstErr = err
+			}
+			s.file = nil
+			s.filePath = ""
+		} else if s.spilled {
+			if s.fileBuf != nil {
+				if err := s.fileBuf.Flush(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if err := s.file.Truncate(0); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if _, err := s.file.Seek(0, io.SeekStart); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if s.fileBuf != nil {
+				s.fileBuf.Reset(s.file)
 			}
 		}
-		if err := s.file.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if err := os.Remove(s.filePath); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
-		}
-		s.file = nil
-		s.filePath = ""
-	}
-	if releaseMem {
-		s.fileBuf = nil
-	}
-	if releaseMem && s.mem != nil {
-		streamJSONBytePool.release(s.mem)
-		s.mem = nil
 	}
 	s.size = 0
+	s.spillCount = 0
+	s.spillBytes = 0
+	s.spilled = false
 	return firstErr
 }

@@ -75,6 +75,21 @@ func BenchmarkQueryStreamRealworld(b *testing.B) {
 							})
 						})
 					})
+					b.Run("decision_only_selector", func(b *testing.B) {
+						var src bytes.Reader
+						reader := bufio.NewReaderSize(&src, 64*1024)
+						onValue := func(QueryStreamValue) error { return nil }
+						runBenchmarkModes(b, func() error {
+							src.Reset(ds.payload)
+							reader.Reset(&src)
+							return QueryStream(QueryStreamRequest{
+								Reader:   reader,
+								Selector: selector,
+								Mode:     QueryDecisionOnly,
+								OnValue:  onValue,
+							})
+						})
+					})
 					b.Run("plus_value_plan", func(b *testing.B) {
 						var src bytes.Reader
 						reader := bufio.NewReaderSize(&src, 64*1024)
@@ -87,6 +102,21 @@ func BenchmarkQueryStreamRealworld(b *testing.B) {
 								Plan:    plan,
 								Mode:    QueryDecisionPlusValue,
 								OnValue: onValue,
+							})
+						})
+					})
+					b.Run("plus_value_selector", func(b *testing.B) {
+						var src bytes.Reader
+						reader := bufio.NewReaderSize(&src, 64*1024)
+						onValue := func(QueryStreamValue) error { return nil }
+						runBenchmarkModes(b, func() error {
+							src.Reset(ds.payload)
+							reader.Reset(&src)
+							return QueryStream(QueryStreamRequest{
+								Reader:   reader,
+								Selector: selector,
+								Mode:     QueryDecisionPlusValue,
+								OnValue:  onValue,
 							})
 						})
 					})

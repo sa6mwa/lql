@@ -18,6 +18,16 @@ type SelectorCapabilities struct {
 	RecursivePath bool
 }
 
+// SelectorExecutionTraits reports selector planning hints for stream execution.
+type SelectorExecutionTraits struct {
+	UsesContainsLike   bool
+	UsesRecursivePath  bool
+	UsesWildcardPath   bool
+	RequiresObjectRoot bool
+	// EarlyNonMatchLikely is a best-effort heuristic for low-match workloads.
+	EarlyNonMatchLikely bool
+}
+
 // Families returns sorted selector clause families referenced by the selector.
 func (c SelectorCapabilities) Families() []string {
 	families := make([]string, 0, 9)
@@ -57,6 +67,19 @@ func InspectSelectorCapabilities(sel Selector) SelectorCapabilities {
 	var capabilities SelectorCapabilities
 	inspectSelectorCapabilities(&capabilities, sel)
 	return capabilities
+}
+
+// InspectSelectorExecutionTraits reports execution planning hints for selector evaluation.
+func InspectSelectorExecutionTraits(sel Selector) SelectorExecutionTraits {
+	capabilities := InspectSelectorCapabilities(sel)
+	traits := SelectorExecutionTraits{
+		UsesContainsLike:   capabilities.Contains || capabilities.Prefix,
+		UsesRecursivePath:  capabilities.RecursivePath,
+		UsesWildcardPath:   capabilities.WildcardPath,
+		RequiresObjectRoot: !sel.IsEmpty(),
+	}
+	traits.EarlyNonMatchLikely = traits.RequiresObjectRoot && !traits.UsesRecursivePath && !traits.UsesContainsLike
+	return traits
 }
 
 func inspectSelectorCapabilities(capabilities *SelectorCapabilities, sel Selector) {

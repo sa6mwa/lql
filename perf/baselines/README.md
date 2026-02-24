@@ -17,6 +17,24 @@ LQL_BENCH_MUTATE_SINGLE_COUNT=4000 \
 go test . -run '^$' -bench '^BenchmarkMutateStreamSynthetic$' -benchmem -benchtime=1x
 ```
 
+Lockd fixture benchmark command:
+
+```bash
+go test . -run '^$' -bench '^BenchmarkLockdFixtures$' -benchmem -benchtime=1x
+```
+
+Save lockd fixture baseline:
+
+```bash
+make benchmark-lockd-save
+```
+
+Compare two lockd baselines:
+
+```bash
+make benchmark-lockd-compare OLD=perf/baselines/old.txt NEW=perf/baselines/new.txt
+```
+
 ## Synthetic dataset sizing
 
 Defaults are defined in `cmd/lql/benchmark_selection_test.go`:

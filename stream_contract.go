@@ -6,6 +6,12 @@ import (
 	"fmt"
 )
 
+// ErrStreamStop requests graceful early termination from stream callbacks.
+//
+// When returned from supported callbacks, stream APIs stop scanning and return
+// nil error with stop metadata in result-bearing variants.
+var ErrStreamStop = errors.New("lql: stream stop")
+
 // QueryStreamMode controls payload behavior for QueryStream callbacks.
 type QueryStreamMode uint8
 

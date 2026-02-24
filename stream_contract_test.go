@@ -67,3 +67,10 @@ func TestStreamErrorHelpersAllCodesWrapped(t *testing.T) {
 		})
 	}
 }
+
+func TestErrStreamStopSentinelSupportsWrapping(t *testing.T) {
+	wrapped := errors.Join(errors.New("outer"), ErrStreamStop)
+	if !errors.Is(wrapped, ErrStreamStop) {
+		t.Fatalf("expected errors.Is match for ErrStreamStop")
+	}
+}

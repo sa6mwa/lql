@@ -18,6 +18,56 @@ import (
 
 var queryStreamPayloadHint = newStreamAdaptiveHint(256, 64*1024, 8*1024*1024)
 
+// QueryStreamCapturePolicy controls candidate payload capture strategy in
+// QueryDecisionPlusValue mode.
+type QueryStreamCapturePolicy uint8
+
+const (
+	// QueryCaptureAuto preserves backward-compatible capture behavior.
+	QueryCaptureAuto QueryStreamCapturePolicy = iota
+	// QueryCaptureAllCandidates captures payload bytes for every candidate.
+	QueryCaptureAllCandidates
+	// QueryCaptureMatchesOnlyBestEffort captures only when match payload may be
+	// needed, with conservative fallback to full capture.
+	QueryCaptureMatchesOnlyBestEffort
+)
+
+// QueryStreamStopReason classifies graceful early-stop outcomes.
+type QueryStreamStopReason string
+
+const (
+	// QueryStreamStopNone indicates normal end-of-stream completion.
+	QueryStreamStopNone QueryStreamStopReason = ""
+	// QueryStreamStopMatchLimit indicates MaxMatches stopped the scan.
+	QueryStreamStopMatchLimit QueryStreamStopReason = "match_limit"
+	// QueryStreamStopCandidateLimit indicates MaxCandidates stopped the scan.
+	QueryStreamStopCandidateLimit QueryStreamStopReason = "candidate_limit"
+	// QueryStreamStopByteLimit indicates MaxBytesRead stopped the scan.
+	QueryStreamStopByteLimit QueryStreamStopReason = "byte_limit"
+	// QueryStreamStopCallbackStop indicates callback requested graceful stop.
+	QueryStreamStopCallbackStop QueryStreamStopReason = "callback_stop"
+)
+
+// QueryStreamResult reports deterministic run summary for QueryStream.
+type QueryStreamResult struct {
+	CandidatesSeen    int64
+	CandidatesMatched int64
+	BytesRead         int64
+	BytesCaptured     int64
+	SpillCount        int64
+	SpillBytes        int64
+	StoppedEarly      bool
+	StopReason        QueryStreamStopReason
+	LastOffset        int64
+}
+
+// QueryStreamDecision describes one per-candidate decision event.
+type QueryStreamDecision struct {
+	Matched bool
+	Size    int64
+	Offset  int64
+}
+
 // QueryStreamRequest configures token-stream query evaluation.
 type QueryStreamRequest struct {
 	Ctx      context.Context
@@ -49,7 +99,18 @@ type QueryStreamRequest struct {
 	// non-whitespace byte of each candidate to its closing JSON token, excluding
 	// surrounding top-level separators/whitespace.
 	MaxCandidateBytes int64
-	OnValue           func(QueryStreamValue) error
+	// MaxMatches stops stream after this many matched candidates (<=0 disabled).
+	MaxMatches int64
+	// MaxCandidates stops stream after this many scanned candidates (<=0 disabled).
+	MaxCandidates int64
+	// MaxBytesRead stops stream after this many bytes consumed from input
+	// (<=0 disabled).
+	MaxBytesRead int64
+	// CapturePolicy controls payload capture strategy in plus-value mode.
+	CapturePolicy QueryStreamCapturePolicy
+	// OnDecision runs once per candidate after match decision and before OnValue.
+	OnDecision func(QueryStreamDecision) error
+	OnValue    func(QueryStreamValue) error
 }
 
 // QueryStreamPayloadSink receives candidate payload bytes in IncludeJSON mode.
@@ -129,20 +190,21 @@ func (p QueryStreamPlan) newEngineInto(dst *streamSelectorEngine, hits []bool) (
 	return hits, nil
 }
 
-// QueryStream evaluates selector matches against a JSON stream without
-// materializing full documents.
+// QueryStreamWithResult evaluates selector matches against a JSON stream
+// without materializing full documents and returns run summary.
 //
 // Top-level arrays are treated as streams of candidate values.
-func QueryStream(req QueryStreamRequest) error {
+func QueryStreamWithResult(req QueryStreamRequest) (QueryStreamResult, error) {
+	result := QueryStreamResult{LastOffset: -1}
 	if req.Reader == nil {
-		return &StreamError{
+		return result, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: "query stream reader required",
 			Offset: -1,
 		}
 	}
-	if req.OnValue == nil {
-		return &StreamError{
+	if req.OnValue == nil && req.OnDecision == nil {
+		return result, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: "query stream callback required",
 			Offset: -1,
@@ -156,28 +218,39 @@ func QueryStream(req QueryStreamRequest) error {
 		includeJSON = false
 	case QueryDecisionPlusValue:
 		includeJSON = true
+		if req.OnValue == nil {
+			return result, &StreamError{
+				Code:   StreamErrorInvalidBody,
+				Detail: "query stream plus-value mode requires callback",
+				Offset: -1,
+			}
+		}
 	default:
-		return &StreamError{
+		return result, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: fmt.Sprintf("unknown query stream mode %d", req.Mode),
 			Offset: -1,
 		}
 	}
 	if includeJSON && req.DisableInternalSpool && req.PayloadSinkFactory == nil {
-		return &StreamError{
+		return result, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: "query stream caller spool requested but payload sink factory is nil",
 			Offset: -1,
 		}
 	}
+	if req.OnValue == nil {
+		includeJSON = false
+	}
 
 	state := acquireStreamScanState()
 	defer releaseStreamScanState(state)
 	state.reset(ctx, includeJSON, req)
+	state.result = result
 
 	if !req.Plan.IsZero() {
 		if !req.Selector.IsEmpty() {
-			return &StreamError{
+			return state.result, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "query stream request must set either selector or plan, not both",
 				Offset: -1,
@@ -185,7 +258,7 @@ func QueryStream(req QueryStreamRequest) error {
 		}
 		hits, err := req.Plan.newEngineInto(&state.engineStorage, state.hitsScratch)
 		if err != nil {
-			return &StreamError{
+			return state.result, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "query stream plan is invalid",
 				Offset: -1,
@@ -195,16 +268,32 @@ func QueryStream(req QueryStreamRequest) error {
 		state.hitsScratch = hits
 		state.engine = &state.engineStorage
 	} else {
-		compiled, err := newStreamSelectorEngine(req.Selector)
+		plan, ok := state.getSelectorPlan(req.Selector)
+		if !ok {
+			compiled, err := newStreamSelectorEngine(req.Selector)
+			if err != nil {
+				return state.result, &StreamError{
+					Code:   StreamErrorInvalidSelector,
+					Detail: "invalid selector",
+					Offset: -1,
+					Err:    err,
+				}
+			}
+			plan = QueryStreamPlan{template: compiled}
+			queryStreamSelectorPlanCache.put(req.Selector, plan)
+			state.setSelectorPlan(req.Selector, plan)
+		}
+		hits, err := plan.newEngineInto(&state.engineStorage, state.hitsScratch)
 		if err != nil {
-			return &StreamError{
+			return state.result, &StreamError{
 				Code:   StreamErrorInvalidSelector,
 				Detail: "invalid selector",
 				Offset: -1,
 				Err:    err,
 			}
 		}
-		state.engine = compiled
+		state.hitsScratch = hits
+		state.engine = &state.engineStorage
 	}
 
 	bufReader, ok := req.Reader.(*bufio.Reader)
@@ -217,14 +306,28 @@ func QueryStream(req QueryStreamRequest) error {
 		start, err := readNonSpaceByte(reader)
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				state.result.LastOffset = reader.Offset()
+				state.result.BytesRead = reader.Offset()
+				return state.result, nil
 			}
-			return state.wrapStreamError(err, reader.Offset())
+			return state.result, state.wrapStreamError(err, reader.Offset())
 		}
 		if err := state.consumeCandidate(reader, start); err != nil {
-			return err
+			return state.result, err
+		}
+		if state.stopRequested {
+			return state.result, nil
 		}
 	}
+}
+
+// QueryStream evaluates selector matches against a JSON stream without
+// materializing full documents.
+//
+// Top-level arrays are treated as streams of candidate values.
+func QueryStream(req QueryStreamRequest) error {
+	_, err := QueryStreamWithResult(req)
+	return err
 }
 
 var streamScanStatePool = sync.Pool{
@@ -254,15 +357,24 @@ func releaseStreamScanState(state *streamScanState) {
 	state.engine = nil
 	state.includeJSON = false
 	state.matchedOnly = false
+	state.capturePolicy = QueryCaptureAuto
+	state.onDecision = nil
 	state.onValue = nil
+	state.result = QueryStreamResult{}
+	state.stopRequested = false
 	state.payloadSinkMaker = nil
 	state.disableSpool = false
 	state.maxCandidateBytes = 0
+	state.maxMatches = 0
+	state.maxCandidates = 0
+	state.maxBytesRead = 0
 	state.path = state.path[:0]
 	state.keyBytes = state.keyBytes[:0]
 	state.payload = nil
 	state.payloadBytes = nil
 	state.usingInternal = false
+	state.capturePruneActive = false
+	state.captureDisabled = false
 	state.jsonScratch = state.jsonScratch[:0]
 	state.candidateStart = 0
 	state.readerStorage.r = nil
@@ -281,11 +393,20 @@ type streamScanState struct {
 	hitsScratch   []bool
 	includeJSON   bool
 	matchedOnly   bool
+	capturePolicy QueryStreamCapturePolicy
+	onDecision    func(QueryStreamDecision) error
 	onValue       func(QueryStreamValue) error
+	result        QueryStreamResult
+	stopRequested bool
 
-	payloadSinkMaker  QueryStreamPayloadSinkFactory
-	disableSpool      bool
-	maxCandidateBytes int64
+	payloadSinkMaker   QueryStreamPayloadSinkFactory
+	disableSpool       bool
+	maxCandidateBytes  int64
+	maxMatches         int64
+	maxCandidates      int64
+	maxBytesRead       int64
+	capturePruneActive bool
+	captureDisabled    bool
 
 	path           []streamPathSegment
 	keyBytes       []byte
@@ -303,6 +424,10 @@ type streamScanState struct {
 	stringBuf []byte
 	numberBuf []byte
 	oneByte   [1]byte
+
+	selectorPlanCached bool
+	selectorPlan       QueryStreamPlan
+	selectorPlanKey    Selector
 }
 
 func (s *streamScanState) reset(ctx context.Context, includeJSON bool, req QueryStreamRequest) {
@@ -310,20 +435,50 @@ func (s *streamScanState) reset(ctx context.Context, includeJSON bool, req Query
 	s.engine = nil
 	s.includeJSON = includeJSON
 	s.matchedOnly = req.MatchedOnly
+	s.capturePolicy = req.CapturePolicy
+	if s.capturePolicy == QueryCaptureAuto {
+		s.capturePolicy = QueryCaptureAllCandidates
+	}
+	s.onDecision = req.OnDecision
 	s.onValue = req.OnValue
+	s.result = QueryStreamResult{LastOffset: -1}
+	s.stopRequested = false
 	s.payloadSinkMaker = req.PayloadSinkFactory
 	s.disableSpool = req.DisableInternalSpool
 	s.maxCandidateBytes = req.MaxCandidateBytes
+	s.maxMatches = req.MaxMatches
+	s.maxCandidates = req.MaxCandidates
+	s.maxBytesRead = req.MaxBytesRead
 	s.path = s.path[:0]
 	s.keyBytes = s.keyBytes[:0]
 	s.spoolCfg = normalizeStreamSpoolConfig(req.SpoolMemoryBytes, req.SpoolTempDir, req.SpoolFilePattern)
 	s.payload = nil
 	s.payloadBytes = nil
 	s.usingInternal = false
+	s.capturePruneActive = false
+	s.captureDisabled = false
 	s.jsonScratch = s.jsonScratch[:0]
 	s.stringBuf = s.stringBuf[:0]
 	s.numberBuf = s.numberBuf[:0]
 	s.lastValue = queryStreamPayloadHint.Load()
+}
+
+func (s *streamScanState) getSelectorPlan(selector Selector) (QueryStreamPlan, bool) {
+	if s.selectorPlanCached && selectorEqual(s.selectorPlanKey, selector) {
+		return s.selectorPlan, true
+	}
+	plan, ok := queryStreamSelectorPlanCache.get(selector)
+	if !ok {
+		return QueryStreamPlan{}, false
+	}
+	s.setSelectorPlan(selector, plan)
+	return plan, true
+}
+
+func (s *streamScanState) setSelectorPlan(selector Selector, plan QueryStreamPlan) {
+	s.selectorPlanKey = cloneSelector(selector)
+	s.selectorPlan = plan
+	s.selectorPlanCached = true
 }
 
 func (s *streamScanState) newPayloadSink() (QueryStreamPayloadSink, error) {
@@ -349,7 +504,7 @@ func (s *streamScanState) releaseInternalPayload() {
 	if !s.usingInternal || !s.internalSink.initialized {
 		return
 	}
-	_ = s.internalSink.spool.cleanup(false)
+	_ = s.internalSink.spool.cleanup(true)
 	s.usingInternal = false
 }
 
@@ -364,6 +519,14 @@ type internalQueryPayloadSink struct {
 	spool       streamCandidateSpool
 	initialized bool
 }
+
+type queryPayloadStats interface {
+	CapturedBytes() int64
+	SpillCount() int64
+	SpillBytes() int64
+}
+
+type queryDiscardPayloadSink struct{}
 
 func (s *internalQueryPayloadSink) prepare(cfg streamSpoolConfig, hint int) {
 	if !s.initialized {
@@ -405,6 +568,54 @@ func (s *internalQueryPayloadSink) Cleanup() error {
 	return s.spool.cleanup(false)
 }
 
+func (s *internalQueryPayloadSink) CapturedBytes() int64 {
+	return s.spool.Size()
+}
+
+func (s *internalQueryPayloadSink) SpillCount() int64 {
+	return s.spool.SpillCount()
+}
+
+func (s *internalQueryPayloadSink) SpillBytes() int64 {
+	return s.spool.SpillBytes()
+}
+
+func (s queryDiscardPayloadSink) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (s queryDiscardPayloadSink) Finalize() error {
+	return nil
+}
+
+func (s queryDiscardPayloadSink) Open() (io.ReadCloser, error) {
+	return nil, fmt.Errorf("query stream payload unavailable for discarded capture")
+}
+
+func (s queryDiscardPayloadSink) Bytes() []byte {
+	return nil
+}
+
+func (s queryDiscardPayloadSink) SizeHint() int {
+	return 0
+}
+
+func (s queryDiscardPayloadSink) Cleanup() error {
+	return nil
+}
+
+func (s queryDiscardPayloadSink) CapturedBytes() int64 {
+	return 0
+}
+
+func (s queryDiscardPayloadSink) SpillCount() int64 {
+	return 0
+}
+
+func (s queryDiscardPayloadSink) SpillBytes() int64 {
+	return 0
+}
+
 func (s *streamScanState) consumeCandidate(reader *streamByteReader, start byte) error {
 	s.candidateStart = reader.Offset() - 1
 	if start == '[' {
@@ -419,9 +630,20 @@ func (s *streamScanState) consumeCandidate(reader *streamByteReader, start byte)
 	s.keyBytes = s.keyBytes[:0]
 
 	if s.includeJSON {
-		payload, err := s.newPayloadSink()
-		if err != nil {
-			return s.wrapStreamError(err, reader.Offset())
+		var (
+			payload QueryStreamPayloadSink
+			err     error
+		)
+		s.capturePruneActive = false
+		s.captureDisabled = false
+		if s.shouldUseDiscardCapture(start) {
+			payload = queryDiscardPayloadSink{}
+			s.usingInternal = false
+		} else {
+			payload, err = s.newPayloadSink()
+			if err != nil {
+				return s.wrapStreamError(err, reader.Offset())
+			}
 		}
 		s.payload = payload
 		if bw, ok := payload.(interface{ WriteByte(byte) error }); ok {
@@ -429,23 +651,29 @@ func (s *streamScanState) consumeCandidate(reader *streamByteReader, start byte)
 		} else {
 			s.payloadBytes = nil
 		}
+		if start == '{' && s.capturePolicy == QueryCaptureMatchesOnlyBestEffort &&
+			s.matchedOnly && s.engine != nil && !s.engine.emptySelector {
+			s.capturePruneActive = true
+		}
+	} else {
+		s.capturePruneActive = false
+		s.captureDisabled = false
 	}
 
 	kind, err := s.scanValue(reader, start)
 	if err != nil {
 		if s.includeJSON {
-			_ = s.payload.Cleanup()
-			s.payload = nil
-			s.payloadBytes = nil
+			_ = s.cleanupPayload(reader.Offset())
 		}
 		return s.wrapStreamError(err, reader.Offset())
 	}
 	size := reader.Offset() - s.candidateStart
+	s.result.CandidatesSeen++
+	s.result.BytesRead = reader.Offset()
+	s.result.LastOffset = reader.Offset()
 	if s.maxCandidateBytes > 0 && size > s.maxCandidateBytes {
 		if s.includeJSON {
-			_ = s.payload.Cleanup()
-			s.payload = nil
-			s.payloadBytes = nil
+			_ = s.cleanupPayload(reader.Offset())
 		}
 		return &StreamError{
 			Code:   StreamErrorDocumentTooLarge,
@@ -456,56 +684,151 @@ func (s *streamScanState) consumeCandidate(reader *streamByteReader, start byte)
 	}
 
 	matched := s.engine.match(kind == streamValueObject)
+	if matched {
+		s.result.CandidatesMatched++
+	}
+	if s.onDecision != nil {
+		if err := s.onDecision(QueryStreamDecision{
+			Matched: matched,
+			Size:    size,
+			Offset:  s.candidateStart,
+		}); err != nil {
+			cleanupErr := s.cleanupPayload(reader.Offset())
+			if cleanupErr != nil {
+				return cleanupErr
+			}
+			if errors.Is(err, ErrStreamStop) {
+				s.stop(QueryStreamStopCallbackStop)
+				return nil
+			}
+			return err
+		}
+	}
 	if s.matchedOnly && !matched {
 		if s.includeJSON {
-			s.lastValue = s.payload.SizeHint()
-			if s.usingInternal {
-				queryStreamPayloadHint.Observe(s.lastValue)
+			if cleanupErr := s.cleanupPayload(reader.Offset()); cleanupErr != nil {
+				return cleanupErr
 			}
-			if cleanupErr := s.payload.Cleanup(); cleanupErr != nil {
-				return &StreamError{
-					Code:   StreamErrorInternal,
-					Detail: "query payload cleanup failed",
-					Offset: reader.Offset(),
-					Path:   s.currentPointer(),
-					Err:    cleanupErr,
-				}
-			}
-			s.payload = nil
-			s.payloadBytes = nil
 		}
+		s.applyStopLimits()
 		return nil
 	}
 	out := QueryStreamValue{Matched: matched, Size: size}
 	if s.includeJSON {
 		if err := s.payload.Finalize(); err != nil {
+			cleanupErr := s.cleanupPayload(reader.Offset())
+			if cleanupErr != nil {
+				return cleanupErr
+			}
 			return s.wrapStreamError(err, reader.Offset())
 		}
 		out.JSON = s.payload.Bytes()
 		out.OpenJSON = s.openJSON
 	}
-	err = s.onValue(out)
-	if s.includeJSON {
-		s.lastValue = s.payload.SizeHint()
-		if s.usingInternal {
-			queryStreamPayloadHint.Observe(s.lastValue)
-		}
-		if cleanupErr := s.payload.Cleanup(); cleanupErr != nil {
-			return &StreamError{
-				Code:   StreamErrorInternal,
-				Detail: "query payload cleanup failed",
-				Offset: reader.Offset(),
-				Path:   s.currentPointer(),
-				Err:    cleanupErr,
+	if s.onValue == nil {
+		if s.includeJSON {
+			if cleanupErr := s.cleanupPayload(reader.Offset()); cleanupErr != nil {
+				return cleanupErr
 			}
 		}
-		s.payload = nil
-		s.payloadBytes = nil
+		s.applyStopLimits()
+		return nil
+	}
+	err = s.onValue(out)
+	if s.includeJSON {
+		if cleanupErr := s.cleanupPayload(reader.Offset()); cleanupErr != nil {
+			return cleanupErr
+		}
 	}
 	if err != nil {
-		return s.wrapStreamError(err, reader.Offset())
+		if errors.Is(err, ErrStreamStop) {
+			s.stop(QueryStreamStopCallbackStop)
+			return nil
+		}
+		return err
+	}
+	s.applyStopLimits()
+	return nil
+}
+
+func (s *streamScanState) shouldUseDiscardCapture(start byte) bool {
+	if !s.includeJSON || s.capturePolicy != QueryCaptureMatchesOnlyBestEffort {
+		return false
+	}
+	if !s.matchedOnly {
+		return false
+	}
+	if s.engine == nil || s.engine.emptySelector {
+		return false
+	}
+	// Non-object roots cannot match non-empty selectors.
+	return start != '{'
+}
+
+func (s *streamScanState) observeMatchSignal(kind streamValueKind, value any) {
+	if s.engine == nil {
+		return
+	}
+	s.engine.observe(s.path, s.keyBytes, kind, value)
+	s.maybeDisableCaptureForImpossibleMatch()
+}
+
+func (s *streamScanState) maybeDisableCaptureForImpossibleMatch() {
+	if !s.capturePruneActive || s.captureDisabled || s.engine == nil {
+		return
+	}
+	if s.engine.canStillMatchObjectRoot() {
+		return
+	}
+	s.captureDisabled = true
+}
+
+func (s *streamScanState) cleanupPayload(offset int64) error {
+	if s.payload == nil {
+		return nil
+	}
+	if stats, ok := s.payload.(queryPayloadStats); ok {
+		s.result.BytesCaptured += stats.CapturedBytes()
+		s.result.SpillCount += stats.SpillCount()
+		s.result.SpillBytes += stats.SpillBytes()
+	}
+	s.lastValue = s.payload.SizeHint()
+	if s.usingInternal {
+		queryStreamPayloadHint.Observe(s.lastValue)
+	}
+	cleanupErr := s.payload.Cleanup()
+	s.payload = nil
+	s.payloadBytes = nil
+	if cleanupErr != nil {
+		return &StreamError{
+			Code:   StreamErrorInternal,
+			Detail: "query payload cleanup failed",
+			Offset: offset,
+			Path:   s.currentPointer(),
+			Err:    cleanupErr,
+		}
 	}
 	return nil
+}
+
+func (s *streamScanState) stop(reason QueryStreamStopReason) {
+	s.stopRequested = true
+	s.result.StoppedEarly = true
+	s.result.StopReason = reason
+}
+
+func (s *streamScanState) applyStopLimits() {
+	if s.stopRequested {
+		return
+	}
+	switch {
+	case s.maxMatches > 0 && s.result.CandidatesMatched >= s.maxMatches:
+		s.stop(QueryStreamStopMatchLimit)
+	case s.maxCandidates > 0 && s.result.CandidatesSeen >= s.maxCandidates:
+		s.stop(QueryStreamStopCandidateLimit)
+	case s.maxBytesRead > 0 && s.result.BytesRead >= s.maxBytesRead:
+		s.stop(QueryStreamStopByteLimit)
+	}
 }
 
 func (s *streamScanState) wrapStreamError(err error, offset int64) error {
@@ -577,6 +900,9 @@ func (s *streamScanState) consumeTopArray(reader *streamByteReader) error {
 		if err := s.consumeCandidate(reader, start); err != nil {
 			return err
 		}
+		if s.stopRequested {
+			return nil
+		}
 		next, err := readNonSpaceByte(reader)
 		if err != nil {
 			return err
@@ -604,7 +930,7 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 		if len(s.path) == 0 && s.engine != nil && s.engine.fastTopLevel != nil {
 			return s.scanObjectFastTopLevel(reader, s.engine.fastTopLevel)
 		}
-		s.engine.observe(s.path, s.keyBytes, streamValueObject, nil)
+		s.observeMatchSignal(streamValueObject, nil)
 		if s.includeJSON {
 			if err := s.payloadWriteByte('{'); err != nil {
 				return streamValueInvalid, err
@@ -612,7 +938,7 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 		}
 		return s.scanObject(reader)
 	case '[':
-		s.engine.observe(s.path, s.keyBytes, streamValueArray, nil)
+		s.observeMatchSignal(streamValueArray, nil)
 		if s.includeJSON {
 			if err := s.payloadWriteByte('['); err != nil {
 				return streamValueInvalid, err
@@ -629,7 +955,7 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 			} else if err := s.skipString(reader); err != nil {
 				return streamValueInvalid, err
 			}
-			s.engine.observe(s.path, s.keyBytes, streamValueString, nil)
+			s.observeMatchSignal(streamValueString, nil)
 			return streamValueString, nil
 		}
 		value, err := s.readString(reader)
@@ -637,9 +963,9 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 			return streamValueInvalid, err
 		}
 		if needsValue {
-			s.engine.observe(s.path, s.keyBytes, streamValueString, bytesToStringUnsafe(value))
+			s.observeMatchSignal(streamValueString, bytesToStringUnsafe(value))
 		} else {
-			s.engine.observe(s.path, s.keyBytes, streamValueString, nil)
+			s.observeMatchSignal(streamValueString, nil)
 		}
 		if s.includeJSON {
 			if err := s.payloadWriteJSONString(value); err != nil {
@@ -651,9 +977,9 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 		if err := expectLiteral(reader, "rue"); err != nil {
 			return streamValueInvalid, err
 		}
-		s.engine.observe(s.path, s.keyBytes, streamValueBool, true)
+		s.observeMatchSignal(streamValueBool, true)
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonTrueLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonTrueLiteral); err != nil {
 				return streamValueInvalid, err
 			}
 		}
@@ -662,9 +988,9 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 		if err := expectLiteral(reader, "alse"); err != nil {
 			return streamValueInvalid, err
 		}
-		s.engine.observe(s.path, s.keyBytes, streamValueBool, false)
+		s.observeMatchSignal(streamValueBool, false)
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonFalseLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonFalseLiteral); err != nil {
 				return streamValueInvalid, err
 			}
 		}
@@ -673,9 +999,9 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 		if err := expectLiteral(reader, "ull"); err != nil {
 			return streamValueInvalid, err
 		}
-		s.engine.observe(s.path, s.keyBytes, streamValueNull, nil)
+		s.observeMatchSignal(streamValueNull, nil)
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonNullLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonNullLiteral); err != nil {
 				return streamValueInvalid, err
 			}
 		}
@@ -688,9 +1014,9 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 		if err != nil {
 			return streamValueInvalid, err
 		}
-		s.engine.observe(s.path, s.keyBytes, streamValueNumber, json.Number(bytesToStringUnsafe(number)))
+		s.observeMatchSignal(streamValueNumber, json.Number(bytesToStringUnsafe(number)))
 		if s.includeJSON {
-			if _, err := s.payload.Write(number); err != nil {
+			if err := s.payloadWriteBytes(number); err != nil {
 				return streamValueInvalid, err
 			}
 		}
@@ -722,23 +1048,27 @@ func (s *streamScanState) scanObjectFastTopLevel(reader *streamByteReader, progr
 		if next != '"' {
 			return streamValueInvalid, fmt.Errorf("expected string object key")
 		}
-		key, err := s.readString(reader)
+		if s.includeJSON && !first {
+			if err := s.payloadWriteByte(','); err != nil {
+				return streamValueInvalid, err
+			}
+		}
+		key, ok, err := s.readBufferedUnescapedString(reader, s.includeJSON)
 		if err != nil {
 			return streamValueInvalid, err
 		}
-		if s.includeJSON {
-			if !first {
-				if err := s.payloadWriteByte(','); err != nil {
+		if !ok {
+			key, err = s.readString(reader)
+			if err != nil {
+				return streamValueInvalid, err
+			}
+			if s.includeJSON {
+				if err := s.payloadWriteJSONString(key); err != nil {
 					return streamValueInvalid, err
 				}
 			}
-			if err := s.payloadWriteJSONString(key); err != nil {
-				return streamValueInvalid, err
-			}
-			if err := s.payloadWriteByte(':'); err != nil {
-				return streamValueInvalid, err
-			}
 		}
+		field := program.fieldForKey(key)
 
 		colon, err := readNonSpaceByte(reader)
 		if err != nil {
@@ -747,12 +1077,16 @@ func (s *streamScanState) scanObjectFastTopLevel(reader *streamByteReader, progr
 		if colon != ':' {
 			return streamValueInvalid, fmt.Errorf("expected ':' after object key")
 		}
+		if s.includeJSON {
+			if err := s.payloadWriteByte(':'); err != nil {
+				return streamValueInvalid, err
+			}
+		}
 
 		valueStart, err := readNonSpaceByte(reader)
 		if err != nil {
 			return streamValueInvalid, err
 		}
-		field := program.fieldForKey(key)
 		if field != nil && s.fastTopLevelFieldHasPending(field) {
 			if err := s.fastTopLevelObserveValue(reader, valueStart, field); err != nil {
 				return streamValueInvalid, err
@@ -762,6 +1096,7 @@ func (s *streamScanState) scanObjectFastTopLevel(reader *streamByteReader, progr
 				return streamValueInvalid, err
 			}
 		}
+		s.maybeDisableCaptureForImpossibleMatch()
 
 		next, err = readNonSpaceByte(reader)
 		if err != nil {
@@ -813,21 +1148,25 @@ func (s *streamScanState) scanObjectFastTopLevelEq(reader *streamByteReader, cla
 		if next != '"' {
 			return streamValueInvalid, fmt.Errorf("expected string object key")
 		}
-		key, err := s.readString(reader)
+		if s.includeJSON && !first {
+			if err := s.payloadWriteByte(','); err != nil {
+				return streamValueInvalid, err
+			}
+		}
+		keyMatched, ok, err := s.readBufferedUnescapedStringEquals(reader, clause.keyBytes, s.includeJSON)
 		if err != nil {
 			return streamValueInvalid, err
 		}
-		if s.includeJSON {
-			if !first {
-				if err := s.payloadWriteByte(','); err != nil {
+		if !ok {
+			key, err := s.readString(reader)
+			if err != nil {
+				return streamValueInvalid, err
+			}
+			keyMatched = bytes.Equal(key, clause.keyBytes)
+			if s.includeJSON {
+				if err := s.payloadWriteJSONString(key); err != nil {
 					return streamValueInvalid, err
 				}
-			}
-			if err := s.payloadWriteJSONString(key); err != nil {
-				return streamValueInvalid, err
-			}
-			if err := s.payloadWriteByte(':'); err != nil {
-				return streamValueInvalid, err
 			}
 		}
 
@@ -838,12 +1177,17 @@ func (s *streamScanState) scanObjectFastTopLevelEq(reader *streamByteReader, cla
 		if colon != ':' {
 			return streamValueInvalid, fmt.Errorf("expected ':' after object key")
 		}
+		if s.includeJSON {
+			if err := s.payloadWriteByte(':'); err != nil {
+				return streamValueInvalid, err
+			}
+		}
 
 		valueStart, err := readNonSpaceByte(reader)
 		if err != nil {
 			return streamValueInvalid, err
 		}
-		if !matched && bytes.Equal(key, clause.keyBytes) {
+		if !matched && keyMatched {
 			matched, err = s.fastTopLevelEqValueMatches(reader, valueStart, clause)
 			if err != nil {
 				return streamValueInvalid, err
@@ -851,6 +1195,29 @@ func (s *streamScanState) scanObjectFastTopLevelEq(reader *streamByteReader, cla
 		} else {
 			if err := s.copyOrSkipValue(reader, valueStart); err != nil {
 				return streamValueInvalid, err
+			}
+		}
+		s.engine.hits[clause.id] = matched
+		s.maybeDisableCaptureForImpossibleMatch()
+		if matched && !s.includeJSON {
+			next, err = readNonSpaceByte(reader)
+			if err != nil {
+				return streamValueInvalid, err
+			}
+			switch next {
+			case '}':
+				return streamValueObject, nil
+			case ',':
+				next, err = readNonSpaceByte(reader)
+				if err != nil {
+					return streamValueInvalid, err
+				}
+				if err := s.skipObjectFromNext(reader, next); err != nil {
+					return streamValueInvalid, err
+				}
+				return streamValueObject, nil
+			default:
+				return streamValueInvalid, fmt.Errorf("expected ',' or '}' in object, got %q", next)
 			}
 		}
 
@@ -870,7 +1237,6 @@ func (s *streamScanState) scanObjectFastTopLevelEq(reader *streamByteReader, cla
 					return streamValueInvalid, err
 				}
 			}
-			s.engine.hits[clause.id] = matched
 			return streamValueObject, nil
 		default:
 			return streamValueInvalid, fmt.Errorf("expected ',' or '}' in object, got %q", next)
@@ -883,7 +1249,7 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 	switch start {
 	case '"':
 		if !clause.ignoreCase {
-			if matched, ok, err := s.readBufferedUnescapedStringEquals(reader, clause.needle, s.includeJSON); err != nil {
+			if matched, ok, err := s.readBufferedUnescapedStringEquals(reader, clause.needleRaw, s.includeJSON); err != nil {
 				return false, err
 			} else if ok {
 				return matched, nil
@@ -904,7 +1270,7 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 			return false, err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonTrueLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonTrueLiteral); err != nil {
 				return false, err
 			}
 		}
@@ -914,7 +1280,7 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 			return false, err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonFalseLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonFalseLiteral); err != nil {
 				return false, err
 			}
 		}
@@ -924,7 +1290,7 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 			return false, err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonNullLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonNullLiteral); err != nil {
 				return false, err
 			}
 		}
@@ -943,7 +1309,7 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 			return false, err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(number); err != nil {
+			if err := s.payloadWriteBytes(number); err != nil {
 				return false, err
 			}
 		}
@@ -1039,7 +1405,7 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 			return err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonTrueLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonTrueLiteral); err != nil {
 				return err
 			}
 		}
@@ -1055,7 +1421,7 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 			return err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonFalseLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonFalseLiteral); err != nil {
 				return err
 			}
 		}
@@ -1071,7 +1437,7 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 			return err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(jsonNullLiteral); err != nil {
+			if err := s.payloadWriteBytes(jsonNullLiteral); err != nil {
 				return err
 			}
 		}
@@ -1090,7 +1456,7 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 			return err
 		}
 		if s.includeJSON {
-			if _, err := s.payload.Write(numberRaw); err != nil {
+			if err := s.payloadWriteBytes(numberRaw); err != nil {
 				return err
 			}
 		}
@@ -1188,14 +1554,22 @@ func (s *streamScanState) fastTopLevelMatchRange(field *streamFastTopLevelField,
 	}
 }
 
-func (s *streamScanState) readBufferedUnescapedStringEquals(reader *streamByteReader, needle string, writeJSON bool) (matched bool, ok bool, err error) {
+func (s *streamScanState) readBufferedUnescapedStringEquals(reader *streamByteReader, needle []byte, writeJSON bool) (matched bool, ok bool, err error) {
+	candidate, ok, err := s.readBufferedUnescapedString(reader, writeJSON)
+	if err != nil || !ok {
+		return false, ok, err
+	}
+	return bytes.Equal(candidate, needle), true, nil
+}
+
+func (s *streamScanState) readBufferedUnescapedString(reader *streamByteReader, writeJSON bool) (value []byte, ok bool, err error) {
 	buffered := reader.Buffered()
 	if buffered <= 0 {
-		return false, false, nil
+		return nil, false, nil
 	}
 	chunk, err := reader.Peek(buffered)
 	if err != nil && err != io.EOF {
-		return false, false, err
+		return nil, false, err
 	}
 	end := -1
 	for i, ch := range chunk {
@@ -1204,36 +1578,62 @@ func (s *streamScanState) readBufferedUnescapedStringEquals(reader *streamByteRe
 			break
 		}
 		if ch == '\\' || ch < 0x20 {
-			return false, false, nil
+			return nil, false, nil
 		}
 	}
 	if end < 0 {
-		return false, false, nil
+		return nil, false, nil
 	}
-	candidate := chunk[:end]
+	value = chunk[:end]
 	if _, err := reader.Discard(end + 1); err != nil {
-		return false, false, err
+		return nil, false, err
 	}
 	if writeJSON {
-		if err := s.payloadWriteByte('"'); err != nil {
-			return false, false, err
-		}
-		if _, err := s.payload.Write(candidate); err != nil {
-			return false, false, err
-		}
-		if err := s.payloadWriteByte('"'); err != nil {
-			return false, false, err
+		if err := s.payloadWriteRawJSONString(value); err != nil {
+			return nil, false, err
 		}
 	}
-	if len(candidate) != len(needle) {
-		return false, true, nil
-	}
-	for i := range candidate {
-		if candidate[i] != needle[i] {
-			return false, true, nil
+	return value, true, nil
+}
+
+func (s *streamScanState) skipObjectFromNext(reader *streamByteReader, next byte) error {
+	for {
+		if next != '"' {
+			return fmt.Errorf("expected string object key")
+		}
+		if err := s.skipString(reader); err != nil {
+			return err
+		}
+		colon, err := readNonSpaceByte(reader)
+		if err != nil {
+			return err
+		}
+		if colon != ':' {
+			return fmt.Errorf("expected ':' after object key")
+		}
+		valueStart, err := readNonSpaceByte(reader)
+		if err != nil {
+			return err
+		}
+		if err := s.skipValue(reader, valueStart); err != nil {
+			return err
+		}
+		next, err = readNonSpaceByte(reader)
+		if err != nil {
+			return err
+		}
+		switch next {
+		case ',':
+			next, err = readNonSpaceByte(reader)
+			if err != nil {
+				return err
+			}
+		case '}':
+			return nil
+		default:
+			return fmt.Errorf("expected ',' or '}' in object, got %q", next)
 		}
 	}
-	return true, true, nil
 }
 
 func streamEqStringMatch(candidate string, clause *streamFastTopLevelEqClause) bool {
@@ -1269,9 +1669,15 @@ func (s *streamScanState) scanObject(reader *streamByteReader) (streamValueKind,
 		if next != '"' {
 			return streamValueInvalid, fmt.Errorf("expected string object key")
 		}
-		key, err := s.readString(reader)
+		key, ok, err := s.readBufferedUnescapedString(reader, false)
 		if err != nil {
 			return streamValueInvalid, err
+		}
+		if !ok {
+			key, err = s.readString(reader)
+			if err != nil {
+				return streamValueInvalid, err
+			}
 		}
 		if s.includeJSON {
 			if !first {
@@ -1279,8 +1685,14 @@ func (s *streamScanState) scanObject(reader *streamByteReader) (streamValueKind,
 					return streamValueInvalid, err
 				}
 			}
-			if err := s.payloadWriteJSONString(key); err != nil {
-				return streamValueInvalid, err
+			if ok {
+				if err := s.payloadWriteRawJSONString(key); err != nil {
+					return streamValueInvalid, err
+				}
+			} else {
+				if err := s.payloadWriteJSONString(key); err != nil {
+					return streamValueInvalid, err
+				}
 			}
 			if err := s.payloadWriteByte(':'); err != nil {
 				return streamValueInvalid, err
@@ -1401,12 +1813,38 @@ func (s *streamScanState) scanArray(reader *streamByteReader) (streamValueKind, 
 }
 
 func (s *streamScanState) payloadWriteJSONString(value []byte) error {
+	if s.captureDisabled {
+		return nil
+	}
 	s.jsonScratch = appendJSONString(s.jsonScratch[:0], value)
 	_, err := s.payload.Write(s.jsonScratch)
 	return err
 }
 
+func (s *streamScanState) payloadWriteRawJSONString(value []byte) error {
+	if s.captureDisabled {
+		return nil
+	}
+	s.jsonScratch = s.jsonScratch[:0]
+	s.jsonScratch = append(s.jsonScratch, '"')
+	s.jsonScratch = append(s.jsonScratch, value...)
+	s.jsonScratch = append(s.jsonScratch, '"')
+	_, err := s.payload.Write(s.jsonScratch)
+	return err
+}
+
+func (s *streamScanState) payloadWriteBytes(value []byte) error {
+	if s.captureDisabled || len(value) == 0 {
+		return nil
+	}
+	_, err := s.payload.Write(value)
+	return err
+}
+
 func (s *streamScanState) payloadWriteByte(value byte) error {
+	if s.captureDisabled {
+		return nil
+	}
 	if s.payloadBytes != nil {
 		return s.payloadBytes.WriteByte(value)
 	}
@@ -1552,20 +1990,17 @@ func (s *streamScanState) copyValue(reader *streamByteReader, start byte) error 
 		if err := expectLiteral(reader, "rue"); err != nil {
 			return err
 		}
-		_, err := s.payload.Write(jsonTrueLiteral)
-		return err
+		return s.payloadWriteBytes(jsonTrueLiteral)
 	case 'f':
 		if err := expectLiteral(reader, "alse"); err != nil {
 			return err
 		}
-		_, err := s.payload.Write(jsonFalseLiteral)
-		return err
+		return s.payloadWriteBytes(jsonFalseLiteral)
 	case 'n':
 		if err := expectLiteral(reader, "ull"); err != nil {
 			return err
 		}
-		_, err := s.payload.Write(jsonNullLiteral)
-		return err
+		return s.payloadWriteBytes(jsonNullLiteral)
 	default:
 		if !isNumberStart(start) {
 			return fmt.Errorf("unexpected value start %q", start)
@@ -1574,8 +2009,7 @@ func (s *streamScanState) copyValue(reader *streamByteReader, start byte) error 
 		if err != nil {
 			return err
 		}
-		_, err = s.payload.Write(number)
-		return err
+		return s.payloadWriteBytes(number)
 	}
 }
 
@@ -1796,7 +2230,7 @@ func (s *streamScanState) copyRawJSONString(reader *streamByteReader) error {
 			}
 			prefix := leadingRawJSONStringBytes(chunk)
 			if prefix > 0 {
-				if _, err := s.payload.Write(chunk[:prefix]); err != nil {
+				if err := s.payloadWriteBytes(chunk[:prefix]); err != nil {
 					return err
 				}
 				if _, err := reader.Discard(prefix); err != nil {
@@ -2313,6 +2747,7 @@ func bytesToStringUnsafe(buf []byte) string {
 type streamSelectorEngine struct {
 	selector      Selector
 	emptySelector bool
+	program       *streamSelectorProgram
 
 	hits []bool
 
@@ -2344,6 +2779,13 @@ type streamSelectorEngine struct {
 	fastTopLevel   *streamFastTopLevelProgram
 }
 
+type streamSelectorProgram struct {
+	requiredIDs []int
+	not         *streamSelectorProgram
+	and         []*streamSelectorProgram
+	or          []*streamSelectorProgram
+}
+
 type streamFastEqClause struct {
 	id         int
 	path       []streamPathToken
@@ -2364,6 +2806,7 @@ type streamFastTopLevelEqClause struct {
 	key        string
 	keyBytes   []byte
 	needle     string
+	needleRaw  []byte
 	ignoreCase bool
 }
 
@@ -2542,15 +2985,77 @@ func newStreamSelectorEngine(selector Selector) (*streamSelectorEngine, error) {
 		existsIDs:     make(map[string]int),
 	}
 	if engine.emptySelector {
+		engine.program = &streamSelectorProgram{}
 		return engine, nil
 	}
 	if err := engine.collect(selector); err != nil {
 		return nil, err
 	}
+	engine.program = engine.buildSelectorProgram(selector)
 	engine.useDispatch = engine.shouldUseDispatch()
 	engine.buildFastEqPath()
 	engine.buildFastTopLevelProgram()
 	return engine, nil
+}
+
+func (e *streamSelectorEngine) buildSelectorProgram(selector Selector) *streamSelectorProgram {
+	program := &streamSelectorProgram{}
+	if selector.Eq != nil {
+		if id, ok := e.termIDs[selector.Eq]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.Contains != nil {
+		if id, ok := e.termIDs[selector.Contains]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.IContains != nil {
+		if id, ok := e.termIDs[selector.IContains]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.Prefix != nil {
+		if id, ok := e.termIDs[selector.Prefix]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.IPrefix != nil {
+		if id, ok := e.termIDs[selector.IPrefix]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.Range != nil {
+		if id, ok := e.rangeIDs[selector.Range]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.In != nil {
+		if id, ok := e.inIDs[selector.In]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.Exists != "" {
+		if id, ok := e.existsIDs[selector.Exists]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
+	if selector.Not != nil {
+		program.not = e.buildSelectorProgram(*selector.Not)
+	}
+	if len(selector.And) > 0 {
+		program.and = make([]*streamSelectorProgram, 0, len(selector.And))
+		for _, child := range selector.And {
+			program.and = append(program.and, e.buildSelectorProgram(child))
+		}
+	}
+	if len(selector.Or) > 0 {
+		program.or = make([]*streamSelectorProgram, 0, len(selector.Or))
+		for _, child := range selector.Or {
+			program.or = append(program.or, e.buildSelectorProgram(child))
+		}
+	}
+	return program
 }
 
 func (e *streamSelectorEngine) shouldUseDispatch() bool {
@@ -2610,11 +3115,13 @@ func (e *streamSelectorEngine) buildFastEqPath() {
 		ignoreCase: term.IgnoreCase,
 	}
 	if len(path) == 1 && !path[0].arrayOnly {
+		needle := termValueNeedle(term)
 		e.fastTopLevelEq = &streamFastTopLevelEqClause{
 			id:         id,
 			key:        path[0].raw,
 			keyBytes:   path[0].rawBytes,
-			needle:     termValueNeedle(term),
+			needle:     needle,
+			needleRaw:  []byte(needle),
 			ignoreCase: term.IgnoreCase,
 		}
 		return
@@ -3354,51 +3861,109 @@ func (e *streamSelectorEngine) match(rootIsObject bool) bool {
 	if !rootIsObject {
 		return false
 	}
-	return e.matchSelector(e.selector)
+	return e.matchProgram(e.program)
 }
 
-func (e *streamSelectorEngine) matchSelector(selector Selector) bool {
-	if len(selector.Or) > 0 {
-		for _, branch := range selector.Or {
-			if e.matchSelector(branch) {
+func (e *streamSelectorEngine) canStillMatchObjectRoot() bool {
+	if e == nil {
+		return false
+	}
+	if e.emptySelector {
+		return true
+	}
+	possibility := e.programFuturePossibility(e.program)
+	return possibility.canTrue
+}
+
+type selectorFuturePossibility struct {
+	canTrue  bool
+	canFalse bool
+}
+
+func (e *streamSelectorEngine) matchProgram(program *streamSelectorProgram) bool {
+	if program == nil {
+		return true
+	}
+	if len(program.or) > 0 {
+		for _, branch := range program.or {
+			if e.matchProgram(branch) {
 				return true
 			}
 		}
 		return false
 	}
-	if selector.Not != nil && e.matchSelector(*selector.Not) {
+	if program.not != nil && e.matchProgram(program.not) {
 		return false
 	}
-	if selector.Eq != nil && !e.hits[e.termIDs[selector.Eq]] {
-		return false
+	for _, id := range program.requiredIDs {
+		if id < 0 || id >= len(e.hits) || !e.hits[id] {
+			return false
+		}
 	}
-	if selector.Contains != nil && !e.hits[e.termIDs[selector.Contains]] {
-		return false
-	}
-	if selector.IContains != nil && !e.hits[e.termIDs[selector.IContains]] {
-		return false
-	}
-	if selector.Prefix != nil && !e.hits[e.termIDs[selector.Prefix]] {
-		return false
-	}
-	if selector.IPrefix != nil && !e.hits[e.termIDs[selector.IPrefix]] {
-		return false
-	}
-	if selector.Range != nil && !e.hits[e.rangeIDs[selector.Range]] {
-		return false
-	}
-	if selector.In != nil && !e.hits[e.inIDs[selector.In]] {
-		return false
-	}
-	if selector.Exists != "" && !e.hits[e.existsIDs[selector.Exists]] {
-		return false
-	}
-	for _, clause := range selector.And {
-		if !e.matchSelector(clause) {
+	for _, child := range program.and {
+		if !e.matchProgram(child) {
 			return false
 		}
 	}
 	return true
+}
+
+func (e *streamSelectorEngine) programFuturePossibility(program *streamSelectorProgram) selectorFuturePossibility {
+	if program == nil {
+		return selectorFuturePossibility{canTrue: true, canFalse: true}
+	}
+	if len(program.or) > 0 {
+		canTrue := false
+		canFalse := true
+		for _, branch := range program.or {
+			branchPossibility := e.programFuturePossibility(branch)
+			canTrue = canTrue || branchPossibility.canTrue
+			canFalse = canFalse && branchPossibility.canFalse
+		}
+		return selectorFuturePossibility{
+			canTrue:  canTrue,
+			canFalse: canFalse,
+		}
+	}
+
+	combined := selectorFuturePossibility{canTrue: true, canFalse: false}
+	if program.not != nil {
+		negated := e.programFuturePossibility(program.not)
+		combined = combineSelectorFuturePossibilityAND(combined, selectorFuturePossibility{
+			canTrue:  negated.canFalse,
+			canFalse: negated.canTrue,
+		})
+	}
+	for _, id := range program.requiredIDs {
+		combined = combineSelectorFuturePossibilityAND(combined, clauseFuturePossibility(id >= 0 && id < len(e.hits) && e.hits[id]))
+	}
+	for _, clause := range program.and {
+		combined = combineSelectorFuturePossibilityAND(combined, e.programFuturePossibility(clause))
+	}
+	return combined
+}
+
+func combineSelectorFuturePossibilityAND(
+	left selectorFuturePossibility,
+	right selectorFuturePossibility,
+) selectorFuturePossibility {
+	return selectorFuturePossibility{
+		canTrue:  left.canTrue && right.canTrue,
+		canFalse: left.canFalse || right.canFalse,
+	}
+}
+
+func clauseFuturePossibility(hit bool) selectorFuturePossibility {
+	if hit {
+		return selectorFuturePossibility{
+			canTrue:  true,
+			canFalse: false,
+		}
+	}
+	return selectorFuturePossibility{
+		canTrue:  true,
+		canFalse: true,
+	}
 }
 
 func compileStreamPath(field string) ([]streamPathToken, error) {

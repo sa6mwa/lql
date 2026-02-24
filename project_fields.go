@@ -23,6 +23,23 @@ var projectFieldsReaderPool = sync.Pool{
 	},
 }
 
+type projectFieldsEmptyReader struct{}
+
+func (projectFieldsEmptyReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+var projectFieldsZeroReader io.Reader = projectFieldsEmptyReader{}
+
+var projectFieldsStatePool = sync.Pool{
+	New: func() any {
+		return &projectFieldsState{
+			rootObject:      make(map[string]any, 8),
+			keyScratch:      make([]byte, 0, 256),
+			keyOrderScratch: make([]string, 0, 16),
+			valueHint:       256,
+		}
+	},
+}
+
 // ProjectionPath is a compiled JSON Pointer path used for field projection.
 type ProjectionPath struct {
 	Raw      string
@@ -166,75 +183,54 @@ func ProjectFields(req ProjectFieldsRequest) (result ProjectFieldsResult, err er
 	}
 
 	ctx := normalizeStreamContext(req.Ctx)
-	state := projectFieldsState{
-		ctx:        ctx,
-		spoolCfg:   normalizeStreamSpoolConfig(req.SpoolMemoryBytes, req.SpoolTempDir, req.SpoolFilePattern),
-		trie:       trie,
-		outputRoot: map[string]any{},
-		valueHint:  256,
-	}
-	defer func() {
-		cleanupErr := state.cleanup()
-		if cleanupErr != nil && err == nil {
-			err = &StreamError{
-				Code:   StreamErrorInternal,
-				Detail: "projection spool cleanup failed",
-				Offset: state.offset(),
-				Err:    cleanupErr,
-			}
-		}
-	}()
+	state := acquireProjectFieldsState()
+	state.reset(ctx, trie, normalizeStreamSpoolConfig(req.SpoolMemoryBytes, req.SpoolTempDir, req.SpoolFilePattern))
 
 	bufReader, pooled := acquireProjectFieldsReader(req.Reader)
-	defer releaseProjectFieldsReader(bufReader, pooled)
-	reader := newStreamByteReader(ctx, bufReader)
-	state.parser = mutateStreamState{
-		ctx:    ctx,
-		reader: reader,
-	}
+	state.reader.Reset(ctx, bufReader)
+	state.resetParser(ctx, &state.reader)
 
-	start, readErr := readNonSpaceByte(reader)
+	start, readErr := readNonSpaceByte(&state.reader)
 	if readErr != nil {
 		if readErr == io.EOF {
-			return ProjectFieldsResult{}, &StreamError{
+			return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, &StreamError{
 				Code:   StreamErrorInvalidBody,
 				Detail: "projection input is empty",
 				Offset: -1,
-			}
+			})
 		}
-		return ProjectFieldsResult{}, state.wrapError(readErr)
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, state.wrapError(readErr))
 	}
 	if start != '{' {
-		return ProjectFieldsResult{}, &StreamError{
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: "field selection requires JSON objects",
-			Offset: reader.Offset(),
-		}
+			Offset: state.reader.Offset(),
+		})
 	}
 	if err := state.projectObject(trie); err != nil {
-		return ProjectFieldsResult{}, state.wrapError(err)
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, state.wrapError(err))
 	}
-	if trailing, trailingErr := readNonSpaceByte(reader); trailingErr == nil {
-		return ProjectFieldsResult{}, &StreamError{
+	if trailing, trailingErr := readNonSpaceByte(&state.reader); trailingErr == nil {
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, &StreamError{
 			Code:   StreamErrorInvalidBody,
 			Detail: fmt.Sprintf("unexpected trailing token %q", trailing),
-			Offset: reader.Offset(),
-		}
+			Offset: state.reader.Offset(),
+		})
 	} else if trailingErr != io.EOF {
-		return ProjectFieldsResult{}, state.wrapError(trailingErr)
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, state.wrapError(trailingErr))
 	}
 	if !state.found {
-		return ProjectFieldsResult{Found: false, Size: 0}, nil
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{Found: false, Size: 0}, nil)
 	}
 
-	countWriter := &projectionCountWriter{
-		writer: req.Writer,
-		max:    req.MaxOutputBytes,
+	state.countWriter.writer = req.Writer
+	state.countWriter.size = 0
+	state.countWriter.max = req.MaxOutputBytes
+	if err := writeProjectedValue(&state.countWriter, state.outputRoot, &state.keyScratch, &state.keyOrderScratch); err != nil {
+		return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{}, state.wrapError(err))
 	}
-	if err := writeProjectedValue(countWriter, state.outputRoot, &state.keyScratch); err != nil {
-		return ProjectFieldsResult{}, state.wrapError(err)
-	}
-	return ProjectFieldsResult{Found: true, Size: countWriter.size}, nil
+	return finalizeProjectFields(state, bufReader, pooled, ProjectFieldsResult{Found: true, Size: state.countWriter.size}, nil)
 }
 
 func acquireProjectFieldsReader(reader io.Reader) (*bufio.Reader, bool) {
@@ -250,8 +246,29 @@ func releaseProjectFieldsReader(reader *bufio.Reader, pooled bool) {
 	if !pooled || reader == nil {
 		return
 	}
-	reader.Reset(bytes.NewReader(nil))
+	reader.Reset(projectFieldsZeroReader)
 	projectFieldsReaderPool.Put(reader)
+}
+
+func finalizeProjectFields(
+	state *projectFieldsState,
+	reader *bufio.Reader,
+	pooled bool,
+	result ProjectFieldsResult,
+	err error,
+) (ProjectFieldsResult, error) {
+	releaseProjectFieldsReader(reader, pooled)
+	cleanupErr := state.cleanup()
+	if cleanupErr != nil && err == nil {
+		err = &StreamError{
+			Code:   StreamErrorInternal,
+			Detail: "projection spool cleanup failed",
+			Offset: state.offset(),
+			Err:    cleanupErr,
+		}
+	}
+	releaseProjectFieldsState(state)
+	return result, err
 }
 
 type projectionTrieNode struct {
@@ -330,13 +347,73 @@ type projectFieldsState struct {
 
 	parser mutateStreamState
 	trie   *projectionTrieNode
+	reader streamByteReader
 
-	spoolCfg   streamSpoolConfig
-	candidates []*streamCandidateSpool
-	outputRoot any
-	keyScratch []byte
-	valueHint  int
-	found      bool
+	spoolCfg        streamSpoolConfig
+	spools          []*streamCandidateSpool
+	nextSpool       int
+	leaves          []projectionLeaf
+	nextLeaf        int
+	rootObject      map[string]any
+	outputRoot      any
+	keyScratch      []byte
+	keyOrderScratch []string
+	countWriter     projectionCountWriter
+	valueHint       int
+	found           bool
+}
+
+func acquireProjectFieldsState() *projectFieldsState {
+	return projectFieldsStatePool.Get().(*projectFieldsState)
+}
+
+func releaseProjectFieldsState(state *projectFieldsState) {
+	if state == nil {
+		return
+	}
+	state.ctx = nil
+	state.trie = nil
+	state.spoolCfg = streamSpoolConfig{}
+	state.nextSpool = 0
+	state.nextLeaf = 0
+	state.outputRoot = state.rootObject
+	state.keyScratch = state.keyScratch[:0]
+	state.keyOrderScratch = state.keyOrderScratch[:0]
+	state.countWriter.writer = nil
+	state.countWriter.size = 0
+	state.countWriter.max = 0
+	state.found = false
+	state.parser.ctx = nil
+	state.parser.reader = nil
+	state.parser.stringBuf = state.parser.stringBuf[:0]
+	state.parser.numberBuf = state.parser.numberBuf[:0]
+	state.reader = streamByteReader{}
+	projectFieldsStatePool.Put(state)
+}
+
+func (s *projectFieldsState) reset(ctx context.Context, trie *projectionTrieNode, cfg streamSpoolConfig) {
+	s.ctx = ctx
+	s.trie = trie
+	s.spoolCfg = cfg
+	s.nextSpool = 0
+	s.nextLeaf = 0
+	s.outputRoot = s.rootObject
+	for key := range s.rootObject {
+		delete(s.rootObject, key)
+	}
+	s.keyScratch = s.keyScratch[:0]
+	s.keyOrderScratch = s.keyOrderScratch[:0]
+	s.countWriter.writer = nil
+	s.countWriter.size = 0
+	s.countWriter.max = 0
+	s.found = false
+}
+
+func (s *projectFieldsState) resetParser(ctx context.Context, reader *streamByteReader) {
+	s.parser.ctx = ctx
+	s.parser.reader = reader
+	s.parser.stringBuf = s.parser.stringBuf[:0]
+	s.parser.numberBuf = s.parser.numberBuf[:0]
 }
 
 func (s *projectFieldsState) offset() int64 {
@@ -348,16 +425,49 @@ func (s *projectFieldsState) offset() int64 {
 
 func (s *projectFieldsState) cleanup() error {
 	var firstErr error
-	for _, candidate := range s.candidates {
+	for i := 0; i < s.nextSpool; i++ {
+		candidate := s.spools[i]
 		if candidate == nil {
 			continue
 		}
-		if err := candidate.Cleanup(); err != nil && firstErr == nil {
+		if err := candidate.cleanup(true); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		releaseStreamCandidateSpool(candidate)
+		s.spools[i] = nil
 	}
-	s.candidates = nil
+	for i := 0; i < s.nextLeaf; i++ {
+		s.leaves[i].candidate = nil
+	}
+	s.nextSpool = 0
+	s.nextLeaf = 0
 	return firstErr
+}
+
+func (s *projectFieldsState) acquireCandidateSpool() *streamCandidateSpool {
+	idx := s.nextSpool
+	s.nextSpool++
+	if idx >= len(s.spools) {
+		s.spools = append(s.spools, nil)
+	}
+	candidate := s.spools[idx]
+	if candidate == nil {
+		candidate = acquireStreamCandidateSpool(s.spoolCfg, s.valueHint)
+		s.spools[idx] = candidate
+		return candidate
+	}
+	candidate.resetForCandidate(s.spoolCfg, s.valueHint)
+	return candidate
+}
+
+func (s *projectFieldsState) acquireLeaf(candidate *streamCandidateSpool) *projectionLeaf {
+	idx := s.nextLeaf
+	s.nextLeaf++
+	if idx >= len(s.leaves) {
+		s.leaves = append(s.leaves, projectionLeaf{})
+	}
+	s.leaves[idx].candidate = candidate
+	return &s.leaves[idx]
 }
 
 func (s *projectFieldsState) wrapError(err error) error {
@@ -398,15 +508,14 @@ func (s *projectFieldsState) projectValue(start byte, node *projectionTrieNode) 
 		return s.skipValue(start)
 	}
 	if node.path != nil {
-		candidate := newStreamCandidateSpool(s.spoolCfg, s.valueHint)
+		candidate := s.acquireCandidateSpool()
 		if err := s.copyValue(start, candidate); err != nil {
-			_ = candidate.Cleanup()
+			_ = candidate.cleanup(false)
 			return err
 		}
-		s.candidates = append(s.candidates, candidate)
 		s.valueHint = candidate.SizeHint()
 
-		leaf := &projectionLeaf{candidate: candidate}
+		leaf := s.acquireLeaf(candidate)
 		next, err := assignProjectedField(s.outputRoot, node.path.Segments, leaf)
 		if err != nil {
 			return err
@@ -442,7 +551,7 @@ func (s *projectFieldsState) projectObject(node *projectionTrieNode) error {
 		if err != nil {
 			return err
 		}
-		key := string(keyBytes)
+		key := bytesToStringUnsafe(keyBytes)
 
 		colon, err := readNonSpaceByte(s.parser.reader)
 		if err != nil {
@@ -812,6 +921,20 @@ func (s *projectFieldsState) copyString(out mutateByteWriter) error {
 
 func (s *projectFieldsState) skipString() error {
 	for {
+		if buffered := s.parser.reader.Buffered(); buffered > 0 {
+			chunk, err := s.parser.reader.Peek(buffered)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			prefix := leadingProjectionJSONStringBytes(chunk)
+			if prefix > 0 {
+				if _, err := s.parser.reader.Discard(prefix); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
 		ch, err := s.parser.reader.ReadByte()
 		if err != nil {
 			return err
@@ -847,6 +970,15 @@ func (s *projectFieldsState) skipString() error {
 	}
 }
 
+func leadingProjectionJSONStringBytes(buf []byte) int {
+	for i, ch := range buf {
+		if ch == '"' || ch == '\\' || ch < 0x20 {
+			return i
+		}
+	}
+	return len(buf)
+}
+
 type projectionLeaf struct {
 	candidate *streamCandidateSpool
 }
@@ -857,7 +989,7 @@ func assignProjectedField(node any, path []string, value *projectionLeaf) (any, 
 	}
 	token := path[0]
 	last := len(path) == 1
-	if idx, err := strconv.Atoi(token); err == nil {
+	if idx, ok := parseProjectionArrayIndexSegment(token); ok {
 		if idx < 0 || idx > maxProjectionFieldIndex {
 			return nil, fmt.Errorf("field index %d invalid", idx)
 		}
@@ -910,20 +1042,56 @@ func assignProjectedField(node any, path []string, value *projectionLeaf) (any, 
 	return obj, nil
 }
 
-func writeProjectedValue(w io.Writer, node any, keyScratch *[]byte) error {
+func parseProjectionArrayIndexSegment(token string) (int, bool) {
+	if token == "" {
+		return 0, false
+	}
+	for i := 0; i < len(token); i++ {
+		ch := token[i]
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+	}
+	idx, err := strconv.Atoi(token)
+	if err != nil {
+		return 0, false
+	}
+	return idx, true
+}
+
+func writeProjectedValue(w *projectionCountWriter, node any, keyScratch *[]byte, keyOrderScratch *[]string) error {
 	switch v := node.(type) {
 	case map[string]any:
-		if _, err := w.Write([]byte{'{'}); err != nil {
+		if err := w.WriteByte('{'); err != nil {
 			return err
 		}
-		keys := make([]string, 0, len(v))
+		if len(v) == 1 {
+			for key, child := range v {
+				*keyScratch = appendJSONStringString((*keyScratch)[:0], key)
+				if _, err := w.Write(*keyScratch); err != nil {
+					return err
+				}
+				if err := w.WriteByte(':'); err != nil {
+					return err
+				}
+				if err := writeProjectedValue(w, child, keyScratch, keyOrderScratch); err != nil {
+					return err
+				}
+			}
+			if err := w.WriteByte('}'); err != nil {
+				return err
+			}
+			return nil
+		}
+		keys := (*keyOrderScratch)[:0]
 		for key := range v {
 			keys = append(keys, key)
 		}
+		*keyOrderScratch = keys
 		sort.Strings(keys)
 		for i, key := range keys {
 			if i > 0 {
-				if _, err := w.Write([]byte{','}); err != nil {
+				if err := w.WriteByte(','); err != nil {
 					return err
 				}
 			}
@@ -931,24 +1099,24 @@ func writeProjectedValue(w io.Writer, node any, keyScratch *[]byte) error {
 			if _, err := w.Write(*keyScratch); err != nil {
 				return err
 			}
-			if _, err := w.Write([]byte{':'}); err != nil {
+			if err := w.WriteByte(':'); err != nil {
 				return err
 			}
-			if err := writeProjectedValue(w, v[key], keyScratch); err != nil {
+			if err := writeProjectedValue(w, v[key], keyScratch, keyOrderScratch); err != nil {
 				return err
 			}
 		}
-		if _, err := w.Write([]byte{'}'}); err != nil {
+		if err := w.WriteByte('}'); err != nil {
 			return err
 		}
 		return nil
 	case []any:
-		if _, err := w.Write([]byte{'['}); err != nil {
+		if err := w.WriteByte('['); err != nil {
 			return err
 		}
 		for i := range v {
 			if i > 0 {
-				if _, err := w.Write([]byte{','}); err != nil {
+				if err := w.WriteByte(','); err != nil {
 					return err
 				}
 			}
@@ -958,11 +1126,11 @@ func writeProjectedValue(w io.Writer, node any, keyScratch *[]byte) error {
 				}
 				continue
 			}
-			if err := writeProjectedValue(w, v[i], keyScratch); err != nil {
+			if err := writeProjectedValue(w, v[i], keyScratch, keyOrderScratch); err != nil {
 				return err
 			}
 		}
-		if _, err := w.Write([]byte{']'}); err != nil {
+		if err := w.WriteByte(']'); err != nil {
 			return err
 		}
 		return nil
@@ -971,13 +1139,20 @@ func writeProjectedValue(w io.Writer, node any, keyScratch *[]byte) error {
 			_, err := w.Write(jsonNullLiteral)
 			return err
 		}
+		if payload := v.candidate.PayloadBytes(); payload != nil {
+			_, err := w.Write(payload)
+			return err
+		}
 		reader, err := v.candidate.Open()
 		if err != nil {
 			return err
 		}
-		defer reader.Close()
-		_, err = io.Copy(w, reader)
-		return err
+		_, copyErr := io.Copy(w, reader)
+		closeErr := reader.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
 	default:
 		_, err := w.Write(jsonNullLiteral)
 		return err
@@ -988,6 +1163,7 @@ type projectionCountWriter struct {
 	writer io.Writer
 	size   int64
 	max    int64
+	one    [1]byte
 }
 
 func (w *projectionCountWriter) Write(p []byte) (int, error) {
@@ -1007,6 +1183,12 @@ func (w *projectionCountWriter) Write(p []byte) (int, error) {
 		return n, io.ErrShortWrite
 	}
 	return n, nil
+}
+
+func (w *projectionCountWriter) WriteByte(b byte) error {
+	w.one[0] = b
+	_, err := w.Write(w.one[:])
+	return err
 }
 
 type projectionOutputTooLargeError struct {

@@ -182,3 +182,53 @@ func FuzzMutateStreamModeRobustness(f *testing.F) {
 		})
 	})
 }
+
+func FuzzMutateStreamWithResultWriterParity(f *testing.F) {
+	f.Add([]byte("alpha"), uint8(0), false)
+	f.Add([]byte("beta"), uint8(1), true)
+	f.Add([]byte{0, 1, 2, 3}, uint8(2), false)
+	f.Add([]byte("delta"), uint8(3), true)
+
+	programs := mutateParityPrograms()
+	now := time.Unix(1_750_000_000, 0)
+	f.Fuzz(func(t *testing.T, seed []byte, programIdx uint8, topArray bool) {
+		if len(seed) > 2048 {
+			seed = seed[:2048]
+		}
+		input := synthesizeParityStream(seed, topArray)
+		exprs := programs[int(programIdx)%len(programs)]
+		muts, err := ParseMutations(exprs, now)
+		if err != nil {
+			t.Fatalf("parse mutations: %v", err)
+		}
+
+		var baseline bytes.Buffer
+		err = MutateStream(MutateStreamRequest{
+			Reader:    bytes.NewReader(input),
+			Writer:    &baseline,
+			Mutations: muts,
+		})
+		if err != nil {
+			return
+		}
+
+		var withResultOut bytes.Buffer
+		result, err := MutateStreamWithResult(MutateStreamRequest{
+			Reader:    bytes.NewReader(input),
+			Writer:    &withResultOut,
+			Mutations: muts,
+		})
+		if err != nil {
+			t.Fatalf("mutate stream with result: %v", err)
+		}
+		if !bytes.Equal(withResultOut.Bytes(), baseline.Bytes()) {
+			t.Fatalf("output mismatch between mutate variants")
+		}
+		if result.CandidatesSeen != result.CandidatesWritten {
+			t.Fatalf("unexpected summary mismatch: %+v", result)
+		}
+		if result.BytesWritten != int64(withResultOut.Len()) {
+			t.Fatalf("bytes written mismatch: got=%d want=%d", result.BytesWritten, withResultOut.Len())
+		}
+	})
+}
