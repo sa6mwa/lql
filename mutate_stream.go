@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -329,6 +330,7 @@ func releaseMutateStreamState(state *mutateStreamState) {
 		state.missingCache[i].hasValue = false
 	}
 	state.missingCache = state.missingCache[:0]
+	state.releaseMaterializedPayloads()
 	state.candidateSink.writer = nil
 	state.candidateSink.capture = false
 	state.candidateSink.size = 0
@@ -341,6 +343,9 @@ type mutateStreamState struct {
 	reader           *streamByteReader
 	readerStorage    streamByteReader
 	bufferedReader   *bufio.Reader
+	payloadReader    *bufio.Reader
+	payloadSrc       bytes.Reader
+	payloadReaderBuf streamByteReader
 	onValue          func(MutateStreamValue) error
 	writer           io.Writer
 	mode             MutateStreamMode
@@ -368,6 +373,10 @@ type mutateStreamState struct {
 	stopRequested bool
 
 	missingCache []mutateMissingCacheEntry
+
+	materializedPayloads [][]byte
+	materializeWriter    mutateSliceWriter
+	numberStateWriter    mutateSliceWriter
 }
 
 type mutateMissingMember struct {
@@ -385,6 +394,8 @@ type mutateMissingCacheEntry struct {
 func (s *mutateStreamState) reset(req MutateStreamRequest) {
 	s.ctx = normalizeStreamContext(req.Ctx)
 	s.reader = nil
+	s.payloadSrc.Reset(nil)
+	s.payloadReaderBuf = streamByteReader{}
 	s.onValue = req.OnValue
 	s.writer = req.Writer
 	s.mode = req.Mode
@@ -417,10 +428,19 @@ func (s *mutateStreamState) reset(req MutateStreamRequest) {
 		s.missingCache[i].hasValue = false
 	}
 	s.missingCache = s.missingCache[:0]
+	s.releaseMaterializedPayloads()
 	s.candidateSink.writer = nil
 	s.candidateSink.capture = false
 	s.candidateSink.size = 0
 	s.candidateSink.max = 0
+}
+
+func (s *mutateStreamState) releaseMaterializedPayloads() {
+	for i := range s.materializedPayloads {
+		streamJSONBytePool.release(s.materializedPayloads[i])
+		s.materializedPayloads[i] = nil
+	}
+	s.materializedPayloads = s.materializedPayloads[:0]
 }
 
 type compiledStreamMutation struct {
@@ -503,6 +523,7 @@ func compileMutationTokens(path []string) ([]streamPathToken, error) {
 				out = append(out, streamPathToken{
 					mode:      streamPathTokenLiteral,
 					raw:       segment,
+					rawBytes:  []byte(segment),
 					arrayOnly: true,
 					index:     index,
 				})
@@ -519,6 +540,8 @@ func compileMutationTokens(path []string) ([]streamPathToken, error) {
 }
 
 func (s *mutateStreamState) consumeCandidate(start byte) (err error) {
+	s.releaseMaterializedPayloads()
+	defer s.releaseMaterializedPayloads()
 	candidateStart := s.reader.Offset() - 1
 	if start == '[' && s.flattenTopArray() {
 		if err := s.consumeTopArray(); err != nil {
@@ -787,25 +810,14 @@ func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, ou
 				if !ok {
 					return fmt.Errorf("value at mutation path is not numeric")
 				}
-				next := normalizeNumber(value + compiled.mut.Delta)
-				switch n := next.(type) {
-				case int64:
-					state.kind = mutateValueStateNumber
-					state.payload = nil
-					state.isInt = true
-					state.intVal = n
-				case float64:
-					state.kind = mutateValueStateNumber
-					state.payload = nil
-					state.isInt = false
-					state.floatVal = n
-				default:
-					nextPayload, err := json.Marshal(next)
-					if err != nil {
-						return err
-					}
-					state.kind = mutateValueStatePayload
-					state.payload = nextPayload
+				isInt, intVal, floatVal := normalizeNumberState(value + compiled.mut.Delta)
+				state.kind = mutateValueStateNumber
+				state.payload = nil
+				state.isInt = isInt
+				if isInt {
+					state.intVal = intVal
+				} else {
+					state.floatVal = floatVal
 				}
 			default:
 				return fmt.Errorf("unknown mutation kind")
@@ -870,18 +882,18 @@ func (s *mutateStreamState) materializePendingState(state mutateNodeState, pendi
 		return state, nil
 	}
 	buf := streamJSONBytePool.acquire(s.valueHint)
-	writer := &mutateSliceWriter{buf: buf[:0]}
-	err := s.applyPendingState(state, pending, writer)
+	s.materializeWriter.buf = buf[:0]
+	err := s.applyPendingState(state, pending, &s.materializeWriter)
 	if err != nil {
-		streamJSONBytePool.release(writer.buf)
+		streamJSONBytePool.release(s.materializeWriter.buf)
 		return mutateNodeState{}, err
 	}
-	if len(writer.buf) == 0 {
-		streamJSONBytePool.release(writer.buf)
+	if len(s.materializeWriter.buf) == 0 {
+		streamJSONBytePool.release(s.materializeWriter.buf)
 		return mutateNodeState{kind: mutateValueStateRemoved}, nil
 	}
-	payload := append([]byte(nil), writer.buf...)
-	streamJSONBytePool.release(writer.buf)
+	payload := s.materializeWriter.buf
+	s.materializedPayloads = append(s.materializedPayloads, payload)
 	if len(payload) > 0 {
 		s.valueHint = len(payload)
 	}
@@ -896,13 +908,13 @@ func (s *mutateStreamState) applyPendingState(state mutateNodeState, pending []m
 		return s.mutatePayloadValue(state.payload, pending, out)
 	case mutateValueStateNumber:
 		buf := streamJSONBytePool.acquire(64)
-		tmp := &mutateSliceWriter{buf: buf[:0]}
-		if err := s.writeNodeState(state, tmp); err != nil {
-			streamJSONBytePool.release(tmp.buf)
+		s.numberStateWriter.buf = buf[:0]
+		if err := s.writeNodeState(state, &s.numberStateWriter); err != nil {
+			streamJSONBytePool.release(s.numberStateWriter.buf)
 			return err
 		}
-		err := s.mutatePayloadValue(tmp.buf, pending, out)
-		streamJSONBytePool.release(tmp.buf)
+		err := s.mutatePayloadValue(s.numberStateWriter.buf, pending, out)
+		streamJSONBytePool.release(s.numberStateWriter.buf)
 		return err
 	default:
 		return s.mutateSourceValue(state.start, pending, out)
@@ -968,7 +980,14 @@ func (s *mutateStreamState) mutatePayloadValue(payload []byte, rules []mutateAct
 	}
 	prev := s.reader
 	defer func() { s.reader = prev }()
-	s.reader = newStreamByteReader(s.ctx, bufio.NewReaderSize(bytes.NewReader(payload), 64*1024))
+	s.payloadSrc.Reset(payload)
+	if s.payloadReader == nil {
+		s.payloadReader = bufio.NewReaderSize(&s.payloadSrc, 64*1024)
+	} else {
+		s.payloadReader.Reset(&s.payloadSrc)
+	}
+	s.payloadReaderBuf.Reset(s.ctx, s.payloadReader)
+	s.reader = &s.payloadReaderBuf
 	start, err := readNonSpaceByte(s.reader)
 	if err != nil {
 		return err
@@ -1010,7 +1029,7 @@ func (s *mutateStreamState) mutateObjectValue(rules []mutateActiveRule, out muta
 			continue
 		}
 		token := mut.tokens[rule.pos]
-		if token.mode != streamPathTokenLiteral || token.arrayOnly {
+		if token.mode != streamPathTokenLiteral {
 			continue
 		}
 		if _, exists := potentialIndex(potentialAdds, token.raw); exists {
@@ -1464,9 +1483,6 @@ func advanceMutationPositions(tokens []streamPathToken, pos int, objectSegment b
 		return append(out, pos+1)
 	case streamPathTokenLiteral:
 		if objectSegment {
-			if token.arrayOnly {
-				return out
-			}
 			if streamPathLiteralMatchesKey(token, key) {
 				return append(out, pos+1)
 			}
@@ -1505,6 +1521,17 @@ func parseJSONNumericPayload(payload []byte) (float64, bool, error) {
 	}
 	f, ok := toFloat(value)
 	return f, ok, nil
+}
+
+func normalizeNumberState(f float64) (bool, int64, float64) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return false, 0, f
+	}
+	rounded := math.Round(f)
+	if math.Abs(f-rounded) < 1e-9 {
+		return true, int64(rounded), 0
+	}
+	return false, 0, f
 }
 
 func (s *mutateStreamState) skipValue(start byte) error {

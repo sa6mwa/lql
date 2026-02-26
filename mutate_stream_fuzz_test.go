@@ -60,6 +60,8 @@ func mutateParityPrograms() [][]string {
 		{`/labels/*=tagged`, `/groups/.../sku="Z"`},
 		{`/status=ready`, `/items[]/price=+3`, `/labels/*=tagged`},
 		{`/id=override`, `rm:/labels/env`, `/metrics/retries=+1`},
+		{`/voucher/lines/10/status=patched`},
+		{`/voucher/lines/10/amount=+2`, `/voucher/.../10/code=patched`},
 	}
 }
 

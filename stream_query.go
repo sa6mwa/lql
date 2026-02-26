@@ -2907,6 +2907,7 @@ const (
 	streamTailFilterNone streamTailFilterKind = iota
 	streamTailFilterObjectKey
 	streamTailFilterArrayIndex
+	streamTailFilterNumericLiteral
 )
 
 type streamClauseDispatchIndex struct {
@@ -2923,6 +2924,15 @@ func (d *streamClauseDispatchIndex) add(kind streamTailFilterKind, key string, i
 		}
 		d.object[key] = append(d.object[key], clauseIdx)
 	case streamTailFilterArrayIndex:
+		if d.array == nil {
+			d.array = make(map[int][]int)
+		}
+		d.array[index] = append(d.array[index], clauseIdx)
+	case streamTailFilterNumericLiteral:
+		if d.object == nil {
+			d.object = make(map[string][]int)
+		}
+		d.object[key] = append(d.object[key], clauseIdx)
 		if d.array == nil {
 			d.array = make(map[int][]int)
 		}
@@ -3991,6 +4001,7 @@ func compileStreamPath(field string) ([]streamPathToken, error) {
 				out = append(out, streamPathToken{
 					mode:      streamPathTokenLiteral,
 					raw:       segment,
+					rawBytes:  []byte(segment),
 					arrayOnly: true,
 					index:     index,
 				})
@@ -4042,7 +4053,7 @@ func streamPatternTailFilter(pattern []streamPathToken) (streamTailFilterKind, s
 		return streamTailFilterNone, "", 0
 	}
 	if last.arrayOnly {
-		return streamTailFilterArrayIndex, "", last.index
+		return streamTailFilterNumericLiteral, last.raw, last.index
 	}
 	return streamTailFilterObjectKey, last.raw, 0
 }
@@ -4063,6 +4074,15 @@ func streamPathTailMatches(kind streamTailFilterKind, key []byte, index int, pat
 		return bytes.Equal(keyBytes[segment.keyStart:segment.keyEnd], key)
 	case streamTailFilterArrayIndex:
 		return segment.kind == streamPathArrayIndex && segment.index == index
+	case streamTailFilterNumericLiteral:
+		switch segment.kind {
+		case streamPathObjectKey:
+			return bytes.Equal(keyBytes[segment.keyStart:segment.keyEnd], key)
+		case streamPathArrayIndex:
+			return segment.index == index
+		default:
+			return false
+		}
 	default:
 		return true
 	}
@@ -4079,9 +4099,6 @@ func streamLiteralPathMatches(pattern []streamPathToken, path []streamPathSegmen
 		segment := path[i]
 		switch segment.kind {
 		case streamPathObjectKey:
-			if token.arrayOnly {
-				return false
-			}
 			key := keyBytes[segment.keyStart:segment.keyEnd]
 			if !streamPathLiteralMatchesKey(token, key) {
 				return false
@@ -4201,9 +4218,6 @@ func streamPathTokenMatchesSegment(token streamPathToken, segment streamPathSegm
 	case streamPathTokenLiteral:
 		switch segment.kind {
 		case streamPathObjectKey:
-			if token.arrayOnly {
-				return false
-			}
 			key := keyBytes[segment.keyStart:segment.keyEnd]
 			return streamPathLiteralMatchesKey(token, key)
 		case streamPathArrayIndex:

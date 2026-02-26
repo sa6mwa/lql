@@ -1,0 +1,44 @@
+goos: linux
+goarch: amd64
+pkg: pkt.systems/lql
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/decision_only_selector/warmup_included-12         	       1	  33491870 ns/op	    9872 B/op	      94 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/decision_only_selector/steady_state-12            	       1	  28814842 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/plus_value_selector/warmup_included-12            	       1	  54250292 ns/op	   72784 B/op	      20 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/plus_value_selector/steady_state-12               	       1	  40851923 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/decision_only_plan/warmup_included-12             	       1	  29762370 ns/op	    4992 B/op	      11 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/decision_only_plan/steady_state-12                	       1	  27555651 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/plus_value_plan/warmup_included-12                	       1	  41922466 ns/op	    7824 B/op	      14 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_ndjson_numeric/plus_value_plan/steady_state-12                   	       1	  41176475 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/decision_only_selector/warmup_included-12          	       1	  34528029 ns/op	    9872 B/op	      94 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/decision_only_selector/steady_state-12             	       1	  33268617 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/plus_value_selector/warmup_included-12             	       1	  56292111 ns/op	    8176 B/op	      18 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/plus_value_selector/steady_state-12                	       1	  41095686 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/decision_only_plan/warmup_included-12              	       1	  30254993 ns/op	    4992 B/op	      11 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/decision_only_plan/steady_state-12                 	       1	  30834226 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/plus_value_plan/warmup_included-12                 	       1	  46815557 ns/op	    7824 B/op	      14 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_array_numeric/plus_value_plan/steady_state-12                    	       1	  41111166 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/decision_only_selector/warmup_included-12         	       1	  14923112 ns/op	   10736 B/op	     108 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/decision_only_selector/steady_state-12            	       1	  11452494 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/plus_value_selector/warmup_included-12            	       1	  21971281 ns/op	 3157544 B/op	      23 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/plus_value_selector/steady_state-12               	       1	  15925348 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/decision_only_plan/warmup_included-12             	       1	  16528977 ns/op	    4992 B/op	      11 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/decision_only_plan/steady_state-12                	       1	  11893942 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/plus_value_plan/warmup_included-12                	       1	  22854354 ns/op	 3152528 B/op	      14 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/plus_value_plan/steady_state-12                   	       1	  20942101 ns/op	      24 B/op	       1 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/plus_value_selector_spooled/warmup_included-12    	       1	  18870154 ns/op	   85960 B/op	      34 allocs/op
+BenchmarkQueryStreamNumericPathSynthetic/large_single_numeric/plus_value_selector_spooled/steady_state-12       	       1	  27097872 ns/op	     352 B/op	       9 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_ndjson_numeric/reuse_program/writer_stream/warmup_included-12   	       1	  57493968 ns/op	  126336 B/op	    6063 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_ndjson_numeric/reuse_program/writer_stream/steady_state-12      	       1	  58335474 ns/op	   49568 B/op	    6027 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_ndjson_numeric/reuse_program/callback_raw_json/warmup_included-12         	       1	  79391318 ns/op	  126224 B/op	    6057 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_ndjson_numeric/reuse_program/callback_raw_json/steady_state-12            	       1	  47998966 ns/op	   49824 B/op	    6028 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_array_numeric/reuse_program/writer_stream/warmup_included-12              	       1	  48275154 ns/op	  125968 B/op	    6056 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_array_numeric/reuse_program/writer_stream/steady_state-12                 	       1	  43304614 ns/op	   49568 B/op	    6027 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_array_numeric/reuse_program/callback_raw_json/warmup_included-12          	       1	  55240356 ns/op	  126224 B/op	    6057 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_array_numeric/reuse_program/callback_raw_json/steady_state-12             	       1	  47987229 ns/op	   49824 B/op	    6028 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_single_numeric/reuse_program/writer_stream/warmup_included-12             	       1	  35231450 ns/op	 2447544 B/op	   18054 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_single_numeric/reuse_program/writer_stream/steady_state-12                	       1	  32087691 ns/op	  310256 B/op	    6005 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_single_numeric/reuse_program/callback_raw_json/warmup_included-12         	       1	  37800260 ns/op	 3563928 B/op	   18067 allocs/op
+BenchmarkMutateStreamNumericPathSynthetic/large_single_numeric/reuse_program/callback_raw_json/steady_state-12            	       1	  48795090 ns/op	  376072 B/op	    6013 allocs/op
+PASS
+ok  	pkt.systems/lql	2.607s

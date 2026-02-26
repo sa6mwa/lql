@@ -348,6 +348,11 @@ func paritySelectorExpressions() []string {
 		`/groups/.../sku="B"`,
 		`/items/**/sku="B",exists{/meta/etag}`,
 		`/items/*/sku="B"`,
+		`/voucher/lines/10/amount>=1`,
+		`exists{/voucher/lines/10/status}`,
+		`in{field=/voucher/lines/10/status,any=open|closed|ok|processing}`,
+		`contains{field=/voucher/lines/10/msg,value=line}`,
+		`/voucher/.../10/amount>=1`,
 		`/status="open",or.eq{field=/msg,value="Timeout while reading"},or.eq{field=/msg,value=fail}`,
 		`or.eq{field=/status,value=open},or.eq{field=/status,value=closed},not.eq{field=/region,value=apac},range{field=/latency,gte=50},in{field=/env,any=prod|stage},exists{/meta}`,
 	}
@@ -382,6 +387,33 @@ func synthesizeParityDoc(seed []byte, idx int) map[string]any {
 
 	priceA := int(paritySeedByte(seed, idx*11+3)%50) + 1
 	priceB := int(paritySeedByte(seed, idx*11+4)%80) + 1
+	lineAmount := int(paritySeedByte(seed, idx*11+20)) + 1
+	lineStatus := statuses[int(paritySeedByte(seed, idx*11+21))%len(statuses)]
+	lineMsg := fmt.Sprintf("line-msg-%d", paritySeedByte(seed, idx*11+22))
+	lineCode := fmt.Sprintf("AUTH-10-%d", paritySeedByte(seed, idx*11+23))
+	linesArray := make([]any, 11)
+	for i := range linesArray {
+		linesArray[i] = map[string]any{
+			"amount": i + 1,
+		}
+	}
+	linesArray[10] = map[string]any{
+		"amount": lineAmount,
+		"status": lineStatus,
+		"msg":    lineMsg,
+		"code":   lineCode,
+	}
+	var lines any = map[string]any{
+		"10": map[string]any{
+			"amount": lineAmount,
+			"status": lineStatus,
+			"msg":    lineMsg,
+			"code":   lineCode,
+		},
+	}
+	if paritySeedByte(seed, idx*11+24)%2 == 1 {
+		lines = linesArray
+	}
 
 	return map[string]any{
 		"id":       fmt.Sprintf("doc-%d-%d", idx, paritySeedByte(seed, idx*11+5)),
@@ -411,6 +443,9 @@ func synthesizeParityDoc(seed []byte, idx int) map[string]any {
 					map[string]any{"sku": skus[int(paritySeedByte(seed, idx*11+19))%len(skus)]},
 				},
 			},
+		},
+		"voucher": map[string]any{
+			"lines": lines,
 		},
 	}
 }

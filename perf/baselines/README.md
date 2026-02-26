@@ -17,6 +17,12 @@ LQL_BENCH_MUTATE_SINGLE_COUNT=4000 \
 go test . -run '^$' -bench '^BenchmarkMutateStreamSynthetic$' -benchmem -benchtime=1x
 ```
 
+Numeric-path parity benchmark command:
+
+```bash
+go test . -run '^$' -bench '^Benchmark(QueryStreamNumericPathSynthetic|MutateStreamNumericPathSynthetic)$' -benchmem -benchtime=1x -count=3
+```
+
 Lockd fixture benchmark command:
 
 ```bash
@@ -53,3 +59,8 @@ Override via environment variables when needed.
 - `perf/baselines/2026-02-21-stream-sdk-baseline-legacy-sizes.txt`
 - `perf/baselines/2026-02-21-stream-sdk-custom-scanner-legacy-sizes.txt`
 - `perf/baselines/2026-02-21-mutate-stream-rewrite.txt`
+- `perf/baselines/2026-02-26-numeric-path-4102b3c.txt`
+- `perf/baselines/2026-02-26-numeric-path-iter1-precommit.txt`
+- `perf/baselines/2026-02-26-numeric-path-iter2-precommit.txt`
+- `perf/baselines/2026-02-26-numeric-path-iter3-precommit.txt`
+- `perf/baselines/2026-02-26-numeric-path-iter4-precommit.txt`

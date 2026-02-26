@@ -35,6 +35,9 @@ func TestMutateStreamParityRandomizedPrograms(t *testing.T) {
 		`/items[]/price=+3`,
 		`/labels/*=tagged`,
 		`/groups/.../sku="Z"`,
+		`/voucher/lines/10/status=patched`,
+		`/voucher/lines/10/amount=+2`,
+		`/voucher/.../10/code=patched`,
 	}
 
 	normalize := func(values []any) []any {

@@ -20,12 +20,6 @@ func (r *streamByteReader) Reset(ctx context.Context, br *bufio.Reader) {
 	r.offset = 0
 }
 
-func newStreamByteReader(ctx context.Context, r *bufio.Reader) *streamByteReader {
-	reader := &streamByteReader{}
-	reader.Reset(ctx, r)
-	return reader
-}
-
 func (r *streamByteReader) Offset() int64 {
 	return r.offset
 }
