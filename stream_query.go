@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
@@ -383,6 +384,13 @@ func releaseStreamScanState(state *streamScanState) {
 	state.readerStorage.offset = 0
 	state.stringBuf = state.stringBuf[:0]
 	state.numberBuf = state.numberBuf[:0]
+	state.stringTermIdxScratch = state.stringTermIdxScratch[:0]
+	state.stringInIdxScratch = state.stringInIdxScratch[:0]
+	state.stringExistsIDScratch = state.stringExistsIDScratch[:0]
+	state.stringTermMatchers = state.stringTermMatchers[:0]
+	state.stringInMatchers = state.stringInMatchers[:0]
+	state.stringInAliveScratch = state.stringInAliveScratch[:0]
+	state.stringLowerScratch = state.stringLowerScratch[:0]
 	streamScanStatePool.Put(state)
 }
 
@@ -425,6 +433,14 @@ type streamScanState struct {
 	numberBuf []byte
 	oneByte   [1]byte
 
+	stringTermIdxScratch  []int
+	stringInIdxScratch    []int
+	stringExistsIDScratch []int
+	stringTermMatchers    []streamStringTermMatcher
+	stringInMatchers      []streamStringInMatcher
+	stringInAliveScratch  []bool
+	stringLowerScratch    []byte
+
 	selectorPlanCached bool
 	selectorPlan       QueryStreamPlan
 	selectorPlanKey    Selector
@@ -460,6 +476,13 @@ func (s *streamScanState) reset(ctx context.Context, includeJSON bool, req Query
 	s.jsonScratch = s.jsonScratch[:0]
 	s.stringBuf = s.stringBuf[:0]
 	s.numberBuf = s.numberBuf[:0]
+	s.stringTermIdxScratch = s.stringTermIdxScratch[:0]
+	s.stringInIdxScratch = s.stringInIdxScratch[:0]
+	s.stringExistsIDScratch = s.stringExistsIDScratch[:0]
+	s.stringTermMatchers = s.stringTermMatchers[:0]
+	s.stringInMatchers = s.stringInMatchers[:0]
+	s.stringInAliveScratch = s.stringInAliveScratch[:0]
+	s.stringLowerScratch = s.stringLowerScratch[:0]
 	s.lastValue = queryStreamPayloadHint.Load()
 }
 
@@ -958,20 +981,34 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 			s.observeMatchSignal(streamValueString, nil)
 			return streamValueString, nil
 		}
-		value, err := s.readString(reader)
-		if err != nil {
-			return streamValueInvalid, err
-		}
-		if needsValue {
-			s.observeMatchSignal(streamValueString, bytesToStringUnsafe(value))
-		} else {
-			s.observeMatchSignal(streamValueString, nil)
-		}
-		if s.includeJSON {
-			if err := s.payloadWriteJSONString(value); err != nil {
+		termIdxs, inIdxs, existsIDs := s.engine.collectStringPathClauseSets(
+			s.path,
+			s.keyBytes,
+			s.stringTermIdxScratch,
+			s.stringInIdxScratch,
+			s.stringExistsIDScratch,
+		)
+		s.stringTermIdxScratch = termIdxs
+		s.stringInIdxScratch = inIdxs
+		s.stringExistsIDScratch = existsIDs
+		if len(termIdxs) > 0 || len(inIdxs) > 0 {
+			if err := s.streamMatchStringClauses(reader, termIdxs, inIdxs, s.includeJSON); err != nil {
 				return streamValueInvalid, err
 			}
+			for _, id := range existsIDs {
+				s.engine.hits[id] = true
+			}
+			s.maybeDisableCaptureForImpossibleMatch()
+			return streamValueString, nil
 		}
+		if s.includeJSON {
+			if err := s.copyRawJSONString(reader); err != nil {
+				return streamValueInvalid, err
+			}
+		} else if err := s.skipString(reader); err != nil {
+			return streamValueInvalid, err
+		}
+		s.observeMatchSignal(streamValueString, nil)
 		return streamValueString, nil
 	case 't':
 		if err := expectLiteral(reader, "rue"); err != nil {
@@ -1255,6 +1292,15 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 				return matched, nil
 			}
 		}
+		if clause.termIdx >= 0 {
+			termIdxs := s.stringTermIdxScratch[:0]
+			termIdxs = append(termIdxs, clause.termIdx)
+			s.stringTermIdxScratch = termIdxs
+			if err := s.streamMatchStringClauses(reader, termIdxs, nil, s.includeJSON); err != nil {
+				return false, err
+			}
+			return s.engine.hits[clause.id], nil
+		}
 		value, err := s.readString(reader)
 		if err != nil {
 			return false, err
@@ -1378,18 +1424,28 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 
 	switch start {
 	case '"':
-		if needTerm || needIn {
-			value, err := s.readString(reader)
-			if err != nil {
+		termIdxs := s.stringTermIdxScratch[:0]
+		for _, idx := range field.termIdxs {
+			clause := &s.engine.termClauses[idx]
+			if s.engine.hits[clause.id] {
+				continue
+			}
+			termIdxs = append(termIdxs, idx)
+		}
+		inIdxs := s.stringInIdxScratch[:0]
+		for _, idx := range field.inIdxs {
+			clause := &s.engine.inClauses[idx]
+			if s.engine.hits[clause.id] {
+				continue
+			}
+			inIdxs = append(inIdxs, idx)
+		}
+		s.stringTermIdxScratch = termIdxs
+		s.stringInIdxScratch = inIdxs
+		if len(termIdxs) > 0 || len(inIdxs) > 0 {
+			if err := s.streamMatchStringClauses(reader, termIdxs, inIdxs, s.includeJSON); err != nil {
 				return err
 			}
-			if s.includeJSON {
-				if err := s.payloadWriteJSONString(value); err != nil {
-					return err
-				}
-			}
-			candidate = bytesToStringUnsafe(value)
-			hasCandidate = true
 		} else if s.includeJSON {
 			if err := s.copyRawJSONString(reader); err != nil {
 				return err
@@ -1853,6 +1909,922 @@ func (s *streamScanState) payloadWriteByte(value byte) error {
 	return err
 }
 
+func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, termIdxs []int, inIdxs []int, writeJSON bool) error {
+	if len(termIdxs) == 1 && len(inIdxs) == 0 {
+		clause := &s.engine.termClauses[termIdxs[0]]
+		return s.streamMatchSingleTermClause(reader, clause, writeJSON)
+	}
+	if len(termIdxs) == 0 && len(inIdxs) == 1 {
+		clause := &s.engine.inClauses[inIdxs[0]]
+		return s.streamMatchSingleInClause(reader, clause, writeJSON)
+	}
+
+	s.stringTermMatchers = s.stringTermMatchers[:0]
+	for _, idx := range termIdxs {
+		clause := &s.engine.termClauses[idx]
+		if s.engine.hits[clause.id] {
+			continue
+		}
+		matcher := streamStringTermMatcher{clause: clause}
+		switch clause.mode {
+		case streamTermContains:
+			if len(clause.needleBytes) == 0 {
+				matcher.matched = true
+			}
+		case streamTermPrefix:
+			if len(clause.needleBytes) == 0 {
+				matcher.matched = true
+				matcher.prefixDone = true
+			}
+		}
+		s.stringTermMatchers = append(s.stringTermMatchers, matcher)
+	}
+
+	s.stringInMatchers = s.stringInMatchers[:0]
+	totalInValues := 0
+	for _, idx := range inIdxs {
+		clause := &s.engine.inClauses[idx]
+		if s.engine.hits[clause.id] {
+			continue
+		}
+		totalInValues += len(clause.values)
+	}
+	if totalInValues > 0 {
+		if cap(s.stringInAliveScratch) < totalInValues {
+			s.stringInAliveScratch = make([]bool, totalInValues)
+		}
+		s.stringInAliveScratch = s.stringInAliveScratch[:totalInValues]
+	} else {
+		s.stringInAliveScratch = s.stringInAliveScratch[:0]
+	}
+	aliveOffset := 0
+	for _, idx := range inIdxs {
+		clause := &s.engine.inClauses[idx]
+		if s.engine.hits[clause.id] {
+			continue
+		}
+		alive := s.stringInAliveScratch[aliveOffset : aliveOffset+len(clause.values)]
+		for i := range alive {
+			alive[i] = true
+		}
+		aliveOffset += len(clause.values)
+		s.stringInMatchers = append(s.stringInMatchers, streamStringInMatcher{
+			clause:      clause,
+			alive:       alive,
+			activeCount: len(alive),
+		})
+	}
+
+	if writeJSON {
+		if err := s.payloadWriteByte('"'); err != nil {
+			return err
+		}
+	}
+
+	for {
+		if buffered := reader.Buffered(); buffered > 0 {
+			chunk, err := reader.Peek(buffered)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			prefix := leadingSimpleJSONStringBytes(chunk)
+			if prefix > 0 {
+				segment := chunk[:prefix]
+				if writeJSON {
+					if err := s.payloadWriteBytes(segment); err != nil {
+						return err
+					}
+				}
+				for _, b := range segment {
+					s.streamMatchFeedASCIIByte(b)
+				}
+				if _, err := reader.Discard(prefix); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		ch, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		switch ch {
+		case '"':
+			if writeJSON {
+				if err := s.payloadWriteByte('"'); err != nil {
+					return err
+				}
+			}
+			for i := range s.stringTermMatchers {
+				matcher := &s.stringTermMatchers[i]
+				if matcher.finalMatch() {
+					s.engine.hits[matcher.clause.id] = true
+				}
+			}
+			for i := range s.stringInMatchers {
+				matcher := &s.stringInMatchers[i]
+				if matcher.finalMatch() {
+					s.engine.hits[matcher.clause.id] = true
+				}
+			}
+			return nil
+		case '\\':
+			if writeJSON {
+				if err := s.payloadWriteByte('\\'); err != nil {
+					return err
+				}
+			}
+			escaped, err := reader.ReadByte()
+			if err != nil {
+				return err
+			}
+			if writeJSON {
+				if err := s.payloadWriteByte(escaped); err != nil {
+					return err
+				}
+			}
+			switch escaped {
+			case '"', '\\', '/':
+				s.streamMatchFeedASCIIByte(escaped)
+			case 'b':
+				s.streamMatchFeedASCIIByte('\b')
+			case 'f':
+				s.streamMatchFeedASCIIByte('\f')
+			case 'n':
+				s.streamMatchFeedASCIIByte('\n')
+			case 'r':
+				s.streamMatchFeedASCIIByte('\r')
+			case 't':
+				s.streamMatchFeedASCIIByte('\t')
+			case 'u':
+				r, err := s.readUnicodeEscapeCopy(reader, writeJSON)
+				if err != nil {
+					return err
+				}
+				s.streamMatchFeedRune(r)
+			default:
+				return fmt.Errorf("invalid string escape \\%c", escaped)
+			}
+		default:
+			if ch < 0x20 {
+				return fmt.Errorf("invalid control character in string")
+			}
+			if writeJSON {
+				if err := s.payloadWriteByte(ch); err != nil {
+					return err
+				}
+			}
+			if ch < utf8.RuneSelf {
+				s.streamMatchFeedASCIIByte(ch)
+				continue
+			}
+
+			peek, err := reader.Peek(utf8.UTFMax - 1)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			var buf [utf8.UTFMax]byte
+			buf[0] = ch
+			n := 1 + copy(buf[1:], peek)
+			r, size := utf8.DecodeRune(buf[:n])
+			if r == utf8.RuneError && size == 1 {
+				s.streamMatchFeedRune(utf8.RuneError)
+				continue
+			}
+			if writeJSON {
+				if err := s.payloadWriteBytes(peek[:size-1]); err != nil {
+					return err
+				}
+			}
+			if _, err := reader.Discard(size - 1); err != nil {
+				return err
+			}
+			s.streamMatchFeedRune(r)
+		}
+	}
+}
+
+func (s *streamScanState) streamMatchSingleTermClause(reader *streamByteReader, clause *streamTermClause, writeJSON bool) error {
+	needle := clause.needleBytes
+
+	eqPos := 0
+	eqMismatch := false
+
+	prefixPos := 0
+	prefixDone := false
+	prefixMatch := false
+	if clause.mode == streamTermPrefix && len(needle) == 0 {
+		prefixDone = true
+		prefixMatch = true
+	}
+
+	containsPos := 0
+	containsMatched := clause.mode == streamTermContains && len(needle) == 0
+
+	feedContainsByte := func(b byte) {
+		if containsMatched || len(needle) == 0 {
+			return
+		}
+		for containsPos > 0 && b != needle[containsPos] {
+			containsPos = clause.containsLPS[containsPos-1]
+		}
+		if b == needle[containsPos] {
+			containsPos++
+			if containsPos == len(needle) {
+				containsMatched = true
+				containsPos = clause.containsLPS[containsPos-1]
+			}
+		}
+	}
+
+	feedSegment := func(segment []byte) {
+		if len(segment) == 0 {
+			return
+		}
+		if !clause.ignoreCase {
+			switch clause.mode {
+			case streamTermEq:
+				if eqMismatch {
+					return
+				}
+				rem := len(needle) - eqPos
+				if rem <= 0 {
+					eqMismatch = true
+					return
+				}
+				if len(segment) > rem {
+					if rem > 0 && !bytes.Equal(segment[:rem], needle[eqPos:]) {
+						eqMismatch = true
+						return
+					}
+					eqPos += rem
+					eqMismatch = true
+					return
+				}
+				if !bytes.Equal(segment, needle[eqPos:eqPos+len(segment)]) {
+					eqMismatch = true
+					return
+				}
+				eqPos += len(segment)
+			case streamTermPrefix:
+				if prefixDone {
+					return
+				}
+				rem := len(needle) - prefixPos
+				if rem <= 0 {
+					prefixDone = true
+					prefixMatch = true
+					return
+				}
+				if len(segment) >= rem {
+					prefixMatch = bytes.Equal(segment[:rem], needle[prefixPos:])
+					prefixDone = true
+					return
+				}
+				if !bytes.Equal(segment, needle[prefixPos:prefixPos+len(segment)]) {
+					prefixMatch = false
+					prefixDone = true
+					return
+				}
+				prefixPos += len(segment)
+			case streamTermContains:
+				if containsMatched || len(needle) == 0 {
+					return
+				}
+				if containsPos == 0 {
+					if idx := bytes.Index(segment, needle); idx >= 0 {
+						containsMatched = true
+						return
+					}
+					if len(needle) <= 1 {
+						return
+					}
+					start := len(segment) - (len(needle) - 1)
+					if start < 0 {
+						start = 0
+					}
+					for _, b := range segment[start:] {
+						feedContainsByte(b)
+					}
+					return
+				}
+				for _, b := range segment {
+					feedContainsByte(b)
+				}
+			}
+			return
+		}
+		if clause.mode == streamTermContains {
+			if containsMatched || len(needle) == 0 {
+				return
+			}
+			lowerSegment := s.lowerASCIIBytes(segment)
+			if containsPos == 0 {
+				if idx := bytes.Index(lowerSegment, needle); idx >= 0 {
+					containsMatched = true
+					return
+				}
+				if len(needle) <= 1 {
+					return
+				}
+				start := len(lowerSegment) - (len(needle) - 1)
+				if start < 0 {
+					start = 0
+				}
+				for _, b := range lowerSegment[start:] {
+					feedContainsByte(b)
+				}
+				return
+			}
+			for _, b := range lowerSegment {
+				feedContainsByte(b)
+			}
+			return
+		}
+
+		for _, raw := range segment {
+			b := lowerASCIIByte(raw)
+			switch clause.mode {
+			case streamTermEq:
+				if eqMismatch {
+					continue
+				}
+				if eqPos < len(needle) && needle[eqPos] == b {
+					eqPos++
+				} else {
+					eqMismatch = true
+				}
+			case streamTermPrefix:
+				if prefixDone {
+					continue
+				}
+				if prefixPos < len(needle) && needle[prefixPos] == b {
+					prefixPos++
+					if prefixPos == len(needle) {
+						prefixDone = true
+						prefixMatch = true
+					}
+				} else {
+					prefixDone = true
+					prefixMatch = false
+				}
+			case streamTermContains:
+				feedContainsByte(b)
+			}
+		}
+	}
+
+	feedRune := func(r rune) {
+		if clause.ignoreCase {
+			r = unicode.ToLower(r)
+		}
+		var buf [utf8.UTFMax]byte
+		n := encodeRuneToBytes(buf[:], r)
+		feedSegment(buf[:n])
+	}
+	var one [1]byte
+	feedByte := func(b byte) {
+		one[0] = b
+		feedSegment(one[:])
+	}
+
+	if writeJSON {
+		if err := s.payloadWriteByte('"'); err != nil {
+			return err
+		}
+	}
+
+	for {
+		if buffered := reader.Buffered(); buffered > 0 {
+			chunk, err := reader.Peek(buffered)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			prefix := leadingSimpleJSONStringBytes(chunk)
+			if prefix > 0 {
+				segment := chunk[:prefix]
+				if writeJSON {
+					if err := s.payloadWriteBytes(segment); err != nil {
+						return err
+					}
+				}
+				feedSegment(segment)
+				if _, err := reader.Discard(prefix); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		ch, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		switch ch {
+		case '"':
+			if writeJSON {
+				if err := s.payloadWriteByte('"'); err != nil {
+					return err
+				}
+			}
+			matched := false
+			switch clause.mode {
+			case streamTermEq:
+				matched = !eqMismatch && eqPos == len(needle)
+			case streamTermPrefix:
+				if !prefixDone {
+					prefixMatch = false
+					prefixDone = true
+				}
+				matched = prefixDone && prefixMatch
+			case streamTermContains:
+				matched = containsMatched
+			}
+			if matched {
+				s.engine.hits[clause.id] = true
+			}
+			return nil
+		case '\\':
+			if writeJSON {
+				if err := s.payloadWriteByte('\\'); err != nil {
+					return err
+				}
+			}
+			escaped, err := reader.ReadByte()
+			if err != nil {
+				return err
+			}
+			if writeJSON {
+				if err := s.payloadWriteByte(escaped); err != nil {
+					return err
+				}
+			}
+			switch escaped {
+			case '"', '\\', '/':
+				feedByte(escaped)
+			case 'b':
+				feedByte('\b')
+			case 'f':
+				feedByte('\f')
+			case 'n':
+				feedByte('\n')
+			case 'r':
+				feedByte('\r')
+			case 't':
+				feedByte('\t')
+			case 'u':
+				r, err := s.readUnicodeEscapeCopy(reader, writeJSON)
+				if err != nil {
+					return err
+				}
+				feedRune(r)
+			default:
+				return fmt.Errorf("invalid string escape \\%c", escaped)
+			}
+		default:
+			if ch < 0x20 {
+				return fmt.Errorf("invalid control character in string")
+			}
+			if writeJSON {
+				if err := s.payloadWriteByte(ch); err != nil {
+					return err
+				}
+			}
+			if ch < utf8.RuneSelf {
+				feedByte(ch)
+				continue
+			}
+			peek, err := reader.Peek(utf8.UTFMax - 1)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			var buf [utf8.UTFMax]byte
+			buf[0] = ch
+			n := 1 + copy(buf[1:], peek)
+			r, size := utf8.DecodeRune(buf[:n])
+			if r == utf8.RuneError && size == 1 {
+				feedRune(utf8.RuneError)
+				continue
+			}
+			if writeJSON {
+				if err := s.payloadWriteBytes(peek[:size-1]); err != nil {
+					return err
+				}
+			}
+			if _, err := reader.Discard(size - 1); err != nil {
+				return err
+			}
+			feedRune(r)
+		}
+	}
+}
+
+func (s *streamScanState) streamMatchSingleInClause(reader *streamByteReader, clause *streamInClause, writeJSON bool) error {
+	values := clause.values
+	if cap(s.stringInAliveScratch) < len(values) {
+		s.stringInAliveScratch = make([]bool, len(values))
+	}
+	alive := s.stringInAliveScratch[:len(values)]
+	for i := range alive {
+		alive[i] = true
+	}
+	activeCount := len(alive)
+	pos := 0
+
+	feedSegment := func(segment []byte) {
+		if len(segment) == 0 {
+			return
+		}
+		if activeCount == 0 {
+			pos += len(segment)
+			return
+		}
+		for i, value := range values {
+			if !alive[i] {
+				continue
+			}
+			rem := len(value) - pos
+			if rem <= 0 {
+				alive[i] = false
+				activeCount--
+				continue
+			}
+			if len(segment) > rem {
+				if !bytes.Equal(segment[:rem], value[pos:]) {
+					alive[i] = false
+					activeCount--
+					continue
+				}
+				alive[i] = false
+				activeCount--
+				continue
+			}
+			if !bytes.Equal(segment, value[pos:pos+len(segment)]) {
+				alive[i] = false
+				activeCount--
+			}
+		}
+		pos += len(segment)
+	}
+
+	feedRune := func(r rune) {
+		var buf [utf8.UTFMax]byte
+		n := encodeRuneToBytes(buf[:], r)
+		feedSegment(buf[:n])
+	}
+	var one [1]byte
+	feedByte := func(b byte) {
+		one[0] = b
+		feedSegment(one[:])
+	}
+
+	if writeJSON {
+		if err := s.payloadWriteByte('"'); err != nil {
+			return err
+		}
+	}
+
+	for {
+		if buffered := reader.Buffered(); buffered > 0 {
+			chunk, err := reader.Peek(buffered)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			prefix := leadingSimpleJSONStringBytes(chunk)
+			if prefix > 0 {
+				segment := chunk[:prefix]
+				if writeJSON {
+					if err := s.payloadWriteBytes(segment); err != nil {
+						return err
+					}
+				}
+				feedSegment(segment)
+				if _, err := reader.Discard(prefix); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		ch, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		switch ch {
+		case '"':
+			if writeJSON {
+				if err := s.payloadWriteByte('"'); err != nil {
+					return err
+				}
+			}
+			if activeCount > 0 {
+				for i, value := range values {
+					if alive[i] && len(value) == pos {
+						s.engine.hits[clause.id] = true
+						break
+					}
+				}
+			}
+			return nil
+		case '\\':
+			if writeJSON {
+				if err := s.payloadWriteByte('\\'); err != nil {
+					return err
+				}
+			}
+			escaped, err := reader.ReadByte()
+			if err != nil {
+				return err
+			}
+			if writeJSON {
+				if err := s.payloadWriteByte(escaped); err != nil {
+					return err
+				}
+			}
+			switch escaped {
+			case '"', '\\', '/':
+				feedByte(escaped)
+			case 'b':
+				feedByte('\b')
+			case 'f':
+				feedByte('\f')
+			case 'n':
+				feedByte('\n')
+			case 'r':
+				feedByte('\r')
+			case 't':
+				feedByte('\t')
+			case 'u':
+				r, err := s.readUnicodeEscapeCopy(reader, writeJSON)
+				if err != nil {
+					return err
+				}
+				feedRune(r)
+			default:
+				return fmt.Errorf("invalid string escape \\%c", escaped)
+			}
+		default:
+			if ch < 0x20 {
+				return fmt.Errorf("invalid control character in string")
+			}
+			if writeJSON {
+				if err := s.payloadWriteByte(ch); err != nil {
+					return err
+				}
+			}
+			if ch < utf8.RuneSelf {
+				feedByte(ch)
+				continue
+			}
+			peek, err := reader.Peek(utf8.UTFMax - 1)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			var buf [utf8.UTFMax]byte
+			buf[0] = ch
+			n := 1 + copy(buf[1:], peek)
+			r, size := utf8.DecodeRune(buf[:n])
+			if r == utf8.RuneError && size == 1 {
+				feedRune(utf8.RuneError)
+				continue
+			}
+			if writeJSON {
+				if err := s.payloadWriteBytes(peek[:size-1]); err != nil {
+					return err
+				}
+			}
+			if _, err := reader.Discard(size - 1); err != nil {
+				return err
+			}
+			feedRune(r)
+		}
+	}
+}
+
+func (s *streamScanState) streamMatchFeedASCIIByte(b byte) {
+	lowered := b
+	lowerReady := false
+	for i := range s.stringTermMatchers {
+		matcher := &s.stringTermMatchers[i]
+		mb := b
+		if matcher.clause.ignoreCase {
+			if !lowerReady {
+				lowered = lowerASCIIByte(lowered)
+				lowerReady = true
+			}
+			mb = lowered
+		}
+		matcher.feedByte(mb)
+	}
+	for i := range s.stringInMatchers {
+		s.stringInMatchers[i].feedByte(b)
+	}
+}
+
+func (s *streamScanState) streamMatchFeedRune(r rune) {
+	var rawBuf [utf8.UTFMax]byte
+	rawLen := encodeRuneToBytes(rawBuf[:], r)
+
+	var lowerBuf [utf8.UTFMax]byte
+	lowerLen := 0
+	lowerReady := false
+	for i := range s.stringTermMatchers {
+		matcher := &s.stringTermMatchers[i]
+		data := rawBuf[:rawLen]
+		if matcher.clause.ignoreCase {
+			if !lowerReady {
+				lowerLen = encodeRuneToBytes(lowerBuf[:], unicode.ToLower(r))
+				lowerReady = true
+			}
+			data = lowerBuf[:lowerLen]
+		}
+		for _, b := range data {
+			matcher.feedByte(b)
+		}
+	}
+	for i := range s.stringInMatchers {
+		matcher := &s.stringInMatchers[i]
+		for _, b := range rawBuf[:rawLen] {
+			matcher.feedByte(b)
+		}
+	}
+}
+
+func (s *streamScanState) readUnicodeEscapeCopy(reader *streamByteReader, writeJSON bool) (rune, error) {
+	var value uint16
+	for i := 0; i < 4; i++ {
+		ch, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		if writeJSON {
+			if err := s.payloadWriteByte(ch); err != nil {
+				return 0, err
+			}
+		}
+		value <<= 4
+		switch {
+		case ch >= '0' && ch <= '9':
+			value |= uint16(ch - '0')
+		case ch >= 'a' && ch <= 'f':
+			value |= uint16(ch-'a') + 10
+		case ch >= 'A' && ch <= 'F':
+			value |= uint16(ch-'A') + 10
+		default:
+			return 0, fmt.Errorf("invalid hex digit %q in unicode escape", ch)
+		}
+	}
+	r := rune(value)
+	if !utf16.IsSurrogate(r) {
+		return r, nil
+	}
+	if r < 0xD800 || r > 0xDBFF {
+		return utf8.RuneError, nil
+	}
+
+	lookahead, err := reader.Peek(6)
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	if len(lookahead) >= 6 && lookahead[0] == '\\' && lookahead[1] == 'u' {
+		lo, ok := parseHex4Bytes(lookahead[2:6])
+		if ok {
+			loRune := rune(lo)
+			if loRune >= 0xDC00 && loRune <= 0xDFFF {
+				if writeJSON {
+					if err := s.payloadWriteBytes(lookahead[:6]); err != nil {
+						return 0, err
+					}
+				}
+				if _, err := reader.Discard(6); err != nil {
+					return 0, err
+				}
+				return utf16.DecodeRune(r, loRune), nil
+			}
+		}
+	}
+	return utf8.RuneError, nil
+}
+
+func encodeRuneToBytes(dst []byte, r rune) int {
+	if r < utf8.RuneSelf {
+		dst[0] = byte(r)
+		return 1
+	}
+	return utf8.EncodeRune(dst, r)
+}
+
+func lowerASCIIByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func (s *streamScanState) lowerASCIIBytes(src []byte) []byte {
+	if cap(s.stringLowerScratch) < len(src) {
+		s.stringLowerScratch = make([]byte, len(src))
+	}
+	dst := s.stringLowerScratch[:len(src)]
+	for i, b := range src {
+		dst[i] = lowerASCIIByte(b)
+	}
+	return dst
+}
+
+func (m *streamStringTermMatcher) feedByte(b byte) {
+	needle := m.clause.needleBytes
+	switch m.clause.mode {
+	case streamTermEq:
+		if m.eqMismatch {
+			return
+		}
+		if m.eqPos < len(needle) {
+			if needle[m.eqPos] == b {
+				m.eqPos++
+			} else {
+				m.eqMismatch = true
+			}
+			return
+		}
+		m.eqMismatch = true
+	case streamTermContains:
+		if m.matched || len(needle) == 0 {
+			return
+		}
+		for m.containsPos > 0 && b != needle[m.containsPos] {
+			m.containsPos = m.clause.containsLPS[m.containsPos-1]
+		}
+		if b == needle[m.containsPos] {
+			m.containsPos++
+			if m.containsPos == len(needle) {
+				m.matched = true
+				m.containsPos = m.clause.containsLPS[m.containsPos-1]
+			}
+		}
+	case streamTermPrefix:
+		if m.prefixDone {
+			return
+		}
+		if m.prefixPos < len(needle) && needle[m.prefixPos] == b {
+			m.prefixPos++
+			if m.prefixPos == len(needle) {
+				m.matched = true
+				m.prefixDone = true
+			}
+			return
+		}
+		m.prefixDone = true
+	}
+}
+
+func (m *streamStringTermMatcher) finalMatch() bool {
+	needle := m.clause.needleBytes
+	switch m.clause.mode {
+	case streamTermEq:
+		return !m.eqMismatch && m.eqPos == len(needle)
+	case streamTermContains:
+		return len(needle) == 0 || m.matched
+	case streamTermPrefix:
+		if len(needle) == 0 {
+			return true
+		}
+		return m.matched
+	default:
+		return false
+	}
+}
+
+func (m *streamStringInMatcher) feedByte(b byte) {
+	if m.activeCount == 0 {
+		m.pos++
+		return
+	}
+	for i, value := range m.clause.values {
+		if !m.alive[i] {
+			continue
+		}
+		if m.pos >= len(value) || value[m.pos] != b {
+			m.alive[i] = false
+			m.activeCount--
+		}
+	}
+	m.pos++
+}
+
+func (m *streamStringInMatcher) finalMatch() bool {
+	if m.activeCount == 0 {
+		return false
+	}
+	for i, value := range m.clause.values {
+		if m.alive[i] && len(value) == m.pos {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *streamScanState) readString(reader *streamByteReader) ([]byte, error) {
 	s.stringBuf = s.stringBuf[:0]
 	for {
@@ -2298,6 +3270,29 @@ func leadingRawJSONStringBytes(buf []byte) int {
 
 func isHexDigitByte(ch byte) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+}
+
+func buildKMPPrefixTable(pattern []byte) []int {
+	if len(pattern) == 0 {
+		return nil
+	}
+	lps := make([]int, len(pattern))
+	length := 0
+	for i := 1; i < len(pattern); {
+		if pattern[i] == pattern[length] {
+			length++
+			lps[i] = length
+			i++
+			continue
+		}
+		if length != 0 {
+			length = lps[length-1]
+			continue
+		}
+		lps[i] = 0
+		i++
+	}
+	return lps
 }
 
 func (s *streamScanState) readNumber(reader *streamByteReader, first byte) ([]byte, error) {
@@ -2803,6 +3798,7 @@ type streamFastRecursiveEqClause struct {
 
 type streamFastTopLevelEqClause struct {
 	id         int
+	termIdx    int
 	key        string
 	keyBytes   []byte
 	needle     string
@@ -2860,6 +3856,8 @@ type streamTermClause struct {
 	tailIndex       int
 	mode            streamTermMode
 	needle          string
+	needleBytes     []byte
+	containsLPS     []int
 	ignoreCase      bool
 }
 
@@ -2887,6 +3885,7 @@ type streamInClause struct {
 	tailKeyBytes    []byte
 	tailIndex       int
 	candidate       map[string]struct{}
+	values          [][]byte
 }
 
 type streamExistsClause struct {
@@ -2899,6 +3898,23 @@ type streamExistsClause struct {
 	tailKey         string
 	tailKeyBytes    []byte
 	tailIndex       int
+}
+
+type streamStringTermMatcher struct {
+	clause      *streamTermClause
+	prefixPos   int
+	prefixDone  bool
+	containsPos int
+	eqPos       int
+	eqMismatch  bool
+	matched     bool
+}
+
+type streamStringInMatcher struct {
+	clause      *streamInClause
+	alive       []bool
+	activeCount int
+	pos         int
 }
 
 type streamTailFilterKind uint8
@@ -3088,14 +4104,18 @@ func (e *streamSelectorEngine) buildFastEqPath() {
 		e.fastTopLevelEq = nil
 		return
 	}
-	var path []streamPathToken
+	var (
+		path    []streamPathToken
+		termIdx = -1
+	)
 	for i := range e.termClauses {
 		if e.termClauses[i].id == id {
 			path = e.termClauses[i].path
+			termIdx = i
 			break
 		}
 	}
-	if len(path) == 0 {
+	if len(path) == 0 || termIdx < 0 {
 		e.fastEq = nil
 		e.fastRecursiveEq = nil
 		e.fastTopLevelEq = nil
@@ -3128,6 +4148,7 @@ func (e *streamSelectorEngine) buildFastEqPath() {
 		needle := termValueNeedle(term)
 		e.fastTopLevelEq = &streamFastTopLevelEqClause{
 			id:         id,
+			termIdx:    termIdx,
 			key:        path[0].raw,
 			keyBytes:   path[0].rawBytes,
 			needle:     needle,
@@ -3304,6 +4325,11 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 	if ignoreCase {
 		needle = strings.ToLower(needle)
 	}
+	needleBytes := []byte(needle)
+	var containsLPS []int
+	if mode == streamTermContains && len(needleBytes) > 0 {
+		containsLPS = buildKMPPrefixTable(needleBytes)
+	}
 	e.termClauses = append(e.termClauses, streamTermClause{
 		id:              id,
 		path:            tokens,
@@ -3316,6 +4342,8 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 		tailIndex:       tailIndex,
 		mode:            mode,
 		needle:          needle,
+		needleBytes:     needleBytes,
+		containsLPS:     containsLPS,
 		ignoreCase:      ignoreCase,
 	})
 	e.termDispatch.add(tailKind, tailKey, tailIndex, len(e.termClauses)-1)
@@ -3367,8 +4395,13 @@ func (e *streamSelectorEngine) addInClause(term *InTerm) error {
 	hasRecursive, singleRecursive, recursiveIdx := streamPatternRecursiveInfo(tokens)
 	tailKind, tailKey, tailIndex := streamPatternTailFilter(tokens)
 	candidates := make(map[string]struct{}, len(term.Any))
+	values := make([][]byte, 0, len(term.Any))
 	for _, value := range term.Any {
+		if _, exists := candidates[value]; exists {
+			continue
+		}
 		candidates[value] = struct{}{}
+		values = append(values, []byte(value))
 	}
 	e.inClauses = append(e.inClauses, streamInClause{
 		id:              id,
@@ -3381,6 +4414,7 @@ func (e *streamSelectorEngine) addInClause(term *InTerm) error {
 		tailKeyBytes:    []byte(tailKey),
 		tailIndex:       tailIndex,
 		candidate:       candidates,
+		values:          values,
 	})
 	e.inDispatch.add(tailKind, tailKey, tailIndex, len(e.inClauses)-1)
 	e.hasInClauses = true
@@ -3750,6 +4784,94 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 		}
 		e.hits[clause.id] = true
 	}
+}
+
+func (e *streamSelectorEngine) collectStringPathClauseSets(
+	path []streamPathSegment,
+	keyBytes []byte,
+	termDst []int,
+	inDst []int,
+	existsIDDst []int,
+) ([]int, []int, []int) {
+	termDst = termDst[:0]
+	inDst = inDst[:0]
+	existsIDDst = existsIDDst[:0]
+	if e == nil || e.emptySelector {
+		return termDst, inDst, existsIDDst
+	}
+	if e.useDispatch {
+		termSpecific, termAny := e.termDispatch.candidates(path, keyBytes)
+		termDst = e.appendMatchingTermClauseIndexes(path, keyBytes, termSpecific, termDst)
+		termDst = e.appendMatchingTermClauseIndexes(path, keyBytes, termAny, termDst)
+
+		inSpecific, inAny := e.inDispatch.candidates(path, keyBytes)
+		inDst = e.appendMatchingInClauseIndexes(path, keyBytes, inSpecific, inDst)
+		inDst = e.appendMatchingInClauseIndexes(path, keyBytes, inAny, inDst)
+
+		existsSpecific, existsAny := e.existsDispatch.candidates(path, keyBytes)
+		existsIDDst = e.appendMatchingExistsClauseIDs(path, keyBytes, existsSpecific, existsIDDst)
+		existsIDDst = e.appendMatchingExistsClauseIDs(path, keyBytes, existsAny, existsIDDst)
+		return termDst, inDst, existsIDDst
+	}
+
+	for i := range e.termClauses {
+		clause := &e.termClauses[i]
+		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
+			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		termDst = append(termDst, i)
+	}
+	for i := range e.inClauses {
+		clause := &e.inClauses[i]
+		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
+			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		inDst = append(inDst, i)
+	}
+	for i := range e.existsClauses {
+		clause := &e.existsClauses[i]
+		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
+			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		existsIDDst = append(existsIDDst, clause.id)
+	}
+	return termDst, inDst, existsIDDst
+}
+
+func (e *streamSelectorEngine) appendMatchingTermClauseIndexes(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
+	for _, clauseIdx := range clauseIdxs {
+		clause := &e.termClauses[clauseIdx]
+		if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		dst = append(dst, clauseIdx)
+	}
+	return dst
+}
+
+func (e *streamSelectorEngine) appendMatchingInClauseIndexes(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
+	for _, clauseIdx := range clauseIdxs {
+		clause := &e.inClauses[clauseIdx]
+		if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		dst = append(dst, clauseIdx)
+	}
+	return dst
+}
+
+func (e *streamSelectorEngine) appendMatchingExistsClauseIDs(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
+	for _, clauseIdx := range clauseIdxs {
+		clause := &e.existsClauses[clauseIdx]
+		if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		dst = append(dst, clause.id)
+	}
+	return dst
 }
 
 func (e *streamSelectorEngine) stringValueNeeded(path []streamPathSegment, keyBytes []byte) bool {

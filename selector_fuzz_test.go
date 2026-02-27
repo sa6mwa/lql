@@ -9,14 +9,41 @@ import (
 func FuzzParseSelectorString(f *testing.F) {
 	seed := []string{
 		"",
+		`/status="open"`,
+		`/type!=critical`,
+		`/progress/count>=42`,
+		`/battery_mv<=3600`,
 		"eq{field=/status,value=open}",
-		"contains{field=/msg,value=timeout,ic=t}",
-		"icontains{field=/msg,value=timeout}",
-		"iprefix{field=/service,value=auth}",
+		"eq{f=/status,v=ok}",
+		"not.eq{field=/status,value=closed}",
 		"and.eq{field=/status,value=open},and.eq{field=/owner,value=alice}",
 		"or.eq{field=/status,value=open},or.eq{field=/status,value=processing}",
+		"or.0.eq{field=/status,value=ok},or.0.range{field=/progress,gte=10}",
+		"and.0.eq{field=/status,value=ok},and.0.range{field=/progress,gte=10}",
+		"contains{field=/msg,value=timeout}",
+		"contains{field=/msg,value=timeout,ic=t}",
+		"contains{field=/msg,value=timeout,ignoreCase=f}",
+		"icontains{field=/msg,value=timeout}",
+		"prefix{field=/service,value=auth}",
+		"iprefix{field=/service,value=auth}",
+		"in{field=/env,any=prod|stage}",
+		"in{f=/env,a=prod|stage|dev}",
+		"range{field=/latency,gte=50,lte=300}",
+		"exists{/meta/etag}",
+		"exists{/items/**/sku}",
+		"/items[]/sku=\"B\"",
+		"/items/**/sku=\"B\"",
+		"/groups/.../sku=\"B\"",
+		"and.eq{field=/status,value=open},and.range{field=/progress,gte=10},exists{/meta/etag}",
+		"or.eq{field=/status,value=open},or.eq{field=/status,value=closed},not.eq{field=/region,value=apac}",
 		"and.eq{field=/status,value=open},or.eq{field=/owner,value=\"alice\"}",
+		"and.eq{field=/status,value=open",
+		"in{field=/env,any=}",
+		"contains{field=/msg,value=timeout,ignoreCase=maybe}",
+		"or.0.eq{field=/status,value=ok},or.0.eq{field=/status,value=done}",
+		"and.0.eq{field=/status,value=ok},and.0.eq{field=/status,value=done}",
 	}
+	seed = append(seed, paritySelectorExpressions()...)
 	for _, s := range seed {
 		f.Add(s)
 	}
@@ -34,6 +61,11 @@ func FuzzParseSelectorShorthand(f *testing.F) {
 		{"status", "open", 0},
 		{"progress/count", "42", 2},
 		{"flags/urgent", "true", 1},
+		{"battery_mv", "3600", 5},
+		{"meta/etag", "\"etag-1\"", 0},
+		{"items/0/sku", "B", 0},
+		{"weird key", "value,with,comma", 0},
+		{"tabs\nstate", "on", 0},
 	}
 	for _, seed := range seeds {
 		f.Add(seed.field, seed.value, seed.op)
