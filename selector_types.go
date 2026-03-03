@@ -45,6 +45,26 @@ type Term struct {
 	valueSet   bool
 }
 
+// MarshalJSON preserves omitted-value intent for transport round-trips.
+func (t Term) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Field      string   `json:"field"`
+		Value      *string  `json:"value,omitempty"`
+		Any        []string `json:"any,omitempty"`
+		IgnoreCase bool     `json:"ignoreCase,omitempty"`
+	}
+	out := alias{
+		Field:      t.Field,
+		Any:        t.Any,
+		IgnoreCase: t.IgnoreCase,
+	}
+	if t.valueSet || t.Value != "" {
+		value := t.Value
+		out.Value = &value
+	}
+	return json.Marshal(out)
+}
+
 // UnmarshalJSON accepts string/bool/number for value and converts to string.
 func (t *Term) UnmarshalJSON(data []byte) error {
 	type alias struct {
