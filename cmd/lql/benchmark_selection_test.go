@@ -121,6 +121,9 @@ func loadBenchmarkDatasets() ([]benchmarkDataset, error) {
 					{name: "eq_status_open", args: []string{`/status="open"`}},
 					{name: "and_region_latency", args: []string{`and.eq{field=/region,value=us-west}`, `and.range{field=/metrics/latency_ms,lt=350}`}},
 					{name: "contains_service", args: []string{`contains{field=/service,value=auth}`}},
+					{name: "icontains_service", args: []string{`icontains{field=/service,value=AUTH}`}},
+					{name: "contains_any_service", args: []string{`contains{field=/service,any=auth|search}`}},
+					{name: "icontains_any_service", args: []string{`icontains{field=/service,any=AUTH|GATEWAY}`}},
 				},
 			},
 			{
@@ -130,6 +133,9 @@ func loadBenchmarkDatasets() ([]benchmarkDataset, error) {
 					{name: "eq_status_open", args: []string{`/status="open"`}},
 					{name: "and_region_latency", args: []string{`and.eq{field=/region,value=us-west}`, `and.range{field=/metrics/latency_ms,lt=350}`}},
 					{name: "contains_service", args: []string{`contains{field=/service,value=auth}`}},
+					{name: "icontains_service", args: []string{`icontains{field=/service,value=AUTH}`}},
+					{name: "contains_any_service", args: []string{`contains{field=/service,any=auth|search}`}},
+					{name: "icontains_any_service", args: []string{`icontains{field=/service,any=AUTH|GATEWAY}`}},
 				},
 			},
 			{
@@ -139,6 +145,9 @@ func loadBenchmarkDatasets() ([]benchmarkDataset, error) {
 					{name: "nested_status_match", args: []string{`/records[]/status="open"`}},
 					{name: "nested_and_region_latency", args: []string{`and.eq{field=/records[]/region,value=us-west}`, `and.range{field=/records[]/metrics/latency_ms,lt=350}`}},
 					{name: "nested_contains_service", args: []string{`contains{field=/records[]/service,value=auth}`}},
+					{name: "nested_icontains_service", args: []string{`icontains{field=/records[]/service,value=AUTH}`}},
+					{name: "nested_contains_any_service", args: []string{`contains{field=/records[]/service,any=auth|search}`}},
+					{name: "nested_icontains_any_service", args: []string{`icontains{field=/records[]/service,any=AUTH|GATEWAY}`}},
 				},
 			},
 		}

@@ -226,6 +226,24 @@ func loadQueryBenchmarkDatasets() ([]queryBenchmarkDataset, error) {
 				spoolExpected: false,
 			},
 			{
+				name:          "large_ndjson_contains_any",
+				payload:       ndjson,
+				selectorExpr:  `contains{field=/blob,any=xxxx|nomatch}`,
+				spoolExpected: false,
+			},
+			{
+				name:          "large_ndjson_contains",
+				payload:       ndjson,
+				selectorExpr:  `contains{field=/blob,value=xxxx}`,
+				spoolExpected: false,
+			},
+			{
+				name:          "large_ndjson_icontains",
+				payload:       ndjson,
+				selectorExpr:  `icontains{field=/blob,value=XXXX}`,
+				spoolExpected: false,
+			},
+			{
 				name:          "large_array",
 				payload:       arrayJSON,
 				selectorExpr:  `/status="open"`,

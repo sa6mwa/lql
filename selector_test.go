@@ -531,6 +531,135 @@ func TestParseSelectorContainsVariants(t *testing.T) {
 	})
 }
 
+func TestParseSelectorContainsAnyVariants(t *testing.T) {
+	t.Run("contains any stays single clause with any values", func(t *testing.T) {
+		sel, err := ParseSelectorString(`contains{f=/msg,a=timeout|error}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.Contains == nil {
+			t.Fatalf("expected contains clause, got %+v", sel)
+		}
+		if len(sel.Contains.Any) != 2 {
+			t.Fatalf("expected contains.any with 2 values, got %+v", sel.Contains)
+		}
+		if sel.Contains.Any[0] != "timeout" || sel.Contains.Any[1] != "error" {
+			t.Fatalf("unexpected contains.any values: %+v", sel.Contains.Any)
+		}
+	})
+
+	t.Run("icontains any stays single clause with any values", func(t *testing.T) {
+		sel, err := ParseSelectorString(`icontains{field=/msg,any=timeout|error}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.IContains == nil {
+			t.Fatalf("expected icontains clause, got %+v", sel)
+		}
+		if len(sel.IContains.Any) != 2 {
+			t.Fatalf("expected icontains.any with 2 values, got %+v", sel.IContains)
+		}
+		if sel.IContains.Any[0] != "timeout" || sel.IContains.Any[1] != "error" {
+			t.Fatalf("unexpected icontains.any values: %+v", sel.IContains.Any)
+		}
+	})
+
+	t.Run("contains any single keyword keeps any form", func(t *testing.T) {
+		sel, err := ParseSelectorString(`contains{f=/msg,a=timeout}`)
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if sel.Contains == nil || len(sel.Contains.Any) != 1 || sel.Contains.Any[0] != "timeout" {
+			t.Fatalf("expected contains.any with timeout, got %+v", sel)
+		}
+	})
+}
+
+func TestParseSelectorContainsAnyFailures(t *testing.T) {
+	cases := []string{
+		`contains{f=/msg,v=timeout,a=error}`,
+		`contains{f=/msg,v="",a=error}`,
+		`icontains{f=/msg,value=timeout,any=error}`,
+		`contains{f=/msg,a=}`,
+		`contains{f=/msg,a=||}`,
+		`eq{f=/msg,a=foo|bar}`,
+		`prefix{f=/msg,a=foo|bar}`,
+		`iprefix{f=/msg,a=foo|bar}`,
+	}
+	for _, expr := range cases {
+		expr := expr
+		t.Run(expr, func(t *testing.T) {
+			if _, err := ParseSelectorString(expr); err == nil {
+				t.Fatalf("expected parse error for %q", expr)
+			}
+		})
+	}
+}
+
+func TestParseSelectorMatchAllAliases(t *testing.T) {
+	cases := []string{"", "{}", ".", "/"}
+	for _, expr := range cases {
+		expr := expr
+		t.Run(expr, func(t *testing.T) {
+			sel, err := ParseSelectorString(expr)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			if !sel.IsEmpty() {
+				t.Fatalf("expected match-all selector alias %q to produce empty selector, got %+v", expr, sel)
+			}
+		})
+	}
+}
+
+func TestParseSelectorStringTermEmptyValueSimplifiesToMatchAll(t *testing.T) {
+	cases := []string{
+		`contains{f=/,v=""}`,
+		`icontains{f=/,v=""}`,
+		`prefix{f=/,v=""}`,
+		`iprefix{f=/,v=""}`,
+		`contains{f=/*,v=""}`,
+		`icontains{f=/...,v=""}`,
+		`contains{f=/*}`,
+		`icontains{f=/...}`,
+	}
+	for _, expr := range cases {
+		expr := expr
+		t.Run(expr, func(t *testing.T) {
+			sel, err := ParseSelectorString(expr)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			if !sel.IsEmpty() {
+				t.Fatalf("expected match-all selector for %q, got %+v", expr, sel)
+			}
+		})
+	}
+}
+
+func TestParseSelectorStringTermEmptyValueKeepsFieldScopedClauses(t *testing.T) {
+	cases := []string{
+		`contains{f=/msg}`,
+		`contains{f=/msg,v=""}`,
+		`icontains{f=/msg}`,
+		`prefix{f=/name}`,
+		`iprefix{f=/name,v=""}`,
+		`contains{f=/root/*}`,
+	}
+	for _, expr := range cases {
+		expr := expr
+		t.Run(expr, func(t *testing.T) {
+			sel, err := ParseSelectorString(expr)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			if sel.IsEmpty() {
+				t.Fatalf("expected field-scoped selector for %q, got match-all", expr)
+			}
+		})
+	}
+}
+
 func TestParseSelectorInAnyAliases(t *testing.T) {
 	expr := `in{f=/env,a=prod|stage|dev}`
 	sel, err := ParseSelectorString(expr)

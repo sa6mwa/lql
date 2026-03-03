@@ -42,6 +42,10 @@ func BenchmarkQueryStreamRealworld(b *testing.B) {
 		{name: "array_eq_sparse", expr: `/session_ids[]="woprWEoK-1"`},
 		{name: "recursive_eq_sparse", expr: `/.../event="tabs_update"`},
 		{name: "recursive_nested_eq_sparse", expr: `/.../hash="86dabea3b684cbc7d287ffb741ece4ef859771d4bbd78cb010c23a17adb96728"`},
+		{name: "contains_event_sparse", expr: `contains{field=/event,value=tabs}`},
+		{name: "icontains_component_dense", expr: `icontains{field=/component,value=HOST}`},
+		{name: "contains_any_event_sparse", expr: `contains{field=/event,any=tabs|__nope__}`},
+		{name: "icontains_any_component_dense", expr: `icontains{field=/component,any=HOST|__nope__}`},
 		{name: "multi_clause_and", expr: `/component="host",/event="tabs_update",/active_idx=0,/tab_count=1,exists{/session_ids},/code>=10`},
 	}
 

@@ -259,6 +259,164 @@ func TestMatchesContainsAndCaseModes(t *testing.T) {
 	}
 }
 
+func TestMatchesContainsAnyModes(t *testing.T) {
+	doc := map[string]any{
+		"msg": "Error: Timeout while reading",
+	}
+	cases := []struct {
+		name     string
+		expr     string
+		expected bool
+	}{
+		{name: "contains any match", expr: `contains{f=/msg,a=warn|Timeout}`, expected: true},
+		{name: "contains any no match", expr: `contains{f=/msg,a=warn|fatal}`, expected: false},
+		{name: "icontains any match", expr: `icontains{f=/msg,a=warn|timeout}`, expected: true},
+		{name: "icontains any no match", expr: `icontains{f=/msg,a=warn|fatal}`, expected: false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sel := mustParseSelector(t, tc.expr)
+			got := Matches(sel, doc)
+			if got != tc.expected {
+				t.Fatalf("selector %q expected %v got %v", tc.expr, tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestMatchesContainsAnyEquivalentToExplicitOr(t *testing.T) {
+	anySel := mustParseSelector(t, `contains{f=/msg,a=warn|timeout}`)
+	orSel := mustParseSelector(t, `or.contains{f=/msg,v=warn},or.contains{f=/msg,v=timeout}`)
+	docs := []map[string]any{
+		{"msg": "warn: cache miss"},
+		{"msg": "timeout waiting for reply"},
+		{"msg": "all good"},
+	}
+	for i, doc := range docs {
+		gotAny := Matches(anySel, doc)
+		gotOr := Matches(orSel, doc)
+		if gotAny != gotOr {
+			t.Fatalf("doc[%d] any=%v or=%v", i, gotAny, gotOr)
+		}
+	}
+}
+
+func TestMatchesStringTermEmptyValueRemapsToMatchAll(t *testing.T) {
+	doc := map[string]any{"status": "open"}
+	cases := []struct {
+		name string
+		expr string
+	}{
+		{name: "contains", expr: `contains{f=/,v=""}`},
+		{name: "icontains", expr: `icontains{f=/,v=""}`},
+		{name: "prefix", expr: `prefix{f=/,v=""}`},
+		{name: "iprefix", expr: `iprefix{f=/,v=""}`},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sel := mustParseSelector(t, tc.expr)
+			if !Matches(sel, doc) {
+				t.Fatalf("expected %q to match all documents", tc.expr)
+			}
+		})
+	}
+}
+
+func TestMatchesStringTermOmittedValueActsAsPathAssertionForAllStringSelectors(t *testing.T) {
+	docWithObject := map[string]any{
+		"hello": map[string]any{
+			"world": map[string]any{"nested": true},
+		},
+	}
+	docWithArray := map[string]any{
+		"hello": map[string]any{
+			"world": []any{1, 2, 3},
+		},
+	}
+	docWithNull := map[string]any{
+		"hello": map[string]any{
+			"world": nil,
+		},
+	}
+	docMissingPath := map[string]any{
+		"hello": map[string]any{
+			"other": "x",
+		},
+	}
+
+	cases := []string{
+		`contains{f=/hello/world}`,
+		`icontains{f=/hello/world}`,
+		`prefix{f=/hello/world}`,
+		`iprefix{f=/hello/world}`,
+	}
+	for _, expr := range cases {
+		expr := expr
+		t.Run(expr, func(t *testing.T) {
+			sel := mustParseSelector(t, expr)
+			if !Matches(sel, docWithObject) {
+				t.Fatalf("expected %q to match when path exists regardless of value type", expr)
+			}
+			if !Matches(sel, docWithArray) {
+				t.Fatalf("expected %q to match array value", expr)
+			}
+			if !Matches(sel, docWithNull) {
+				t.Fatalf("expected %q to match null value", expr)
+			}
+			if Matches(sel, docMissingPath) {
+				t.Fatalf("expected %q to reject when asserted path is missing", expr)
+			}
+		})
+	}
+}
+
+func TestMatchesStringTermOmittedValuePathVariants(t *testing.T) {
+	doc := map[string]any{
+		"hello": map[string]any{
+			"world": map[string]any{"nested": true},
+			"names": []any{"alice", "bob"},
+		},
+		"arrays": []any{
+			map[string]any{"id": 1},
+			map[string]any{"id": 2},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		expr     string
+		expected bool
+	}{
+		{name: "object wildcard", expr: `contains{f=/hello/*}`, expected: true},
+		{name: "recursive", expr: `contains{f=/hello/...}`, expected: true},
+		{name: "array wildcard", expr: `contains{f=/arrays/[]}`, expected: true},
+		{name: "array wildcard child", expr: `contains{f=/arrays/[]/id}`, expected: true},
+		{name: "missing literal", expr: `contains{f=/hello/missing}`, expected: false},
+		{name: "missing wildcard parent", expr: `contains{f=/missing/*}`, expected: false},
+		{name: "missing recursive parent", expr: `contains{f=/missing/...}`, expected: false},
+		{name: "missing array parent", expr: `contains{f=/missing/[]}`, expected: false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sel := mustParseSelector(t, tc.expr)
+			got := Matches(sel, doc)
+			if got != tc.expected {
+				t.Fatalf("selector %q expected %v got %v", tc.expr, tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestMatchesNotOfStringTermEmptyValueIsAlwaysFalse(t *testing.T) {
+	sel := mustParseSelector(t, `not.icontains{f=/,v=""}`)
+	if Matches(sel, map[string]any{"status": "open"}) {
+		t.Fatal("expected selector to be always false")
+	}
+}
+
 func TestMatchesSelectorStringsAndSlice(t *testing.T) {
 	sel, err := ParseSelectorStrings([]string{`/status="ok"`, `/msg="done"`})
 	if err != nil {

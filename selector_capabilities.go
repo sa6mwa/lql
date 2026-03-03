@@ -64,6 +64,7 @@ func (c SelectorCapabilities) Families() []string {
 
 // InspectSelectorCapabilities reports selector feature families and path complexity.
 func InspectSelectorCapabilities(sel Selector) SelectorCapabilities {
+	sel = simplifySelector(sel)
 	var capabilities SelectorCapabilities
 	inspectSelectorCapabilities(&capabilities, sel)
 	return capabilities
@@ -71,6 +72,7 @@ func InspectSelectorCapabilities(sel Selector) SelectorCapabilities {
 
 // InspectSelectorExecutionTraits reports execution planning hints for selector evaluation.
 func InspectSelectorExecutionTraits(sel Selector) SelectorExecutionTraits {
+	sel = simplifySelector(sel)
 	capabilities := InspectSelectorCapabilities(sel)
 	traits := SelectorExecutionTraits{
 		UsesContainsLike:   capabilities.Contains || capabilities.Prefix,

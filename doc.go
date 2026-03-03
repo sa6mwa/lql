@@ -10,7 +10,9 @@
 //
 //	eq{field=/status,value=open}
 //	contains{field=/message,value=timeout}
+//	contains{field=/message,any=timeout|degraded}
 //	icontains{field=/message,value=timeout}
+//	icontains{field=/service,a=AUTH|EDGE}
 //	prefix{field=/owner,value=team-}
 //	iprefix{field=/owner,value=team-}
 //	range{field=/progress,gt=10}
@@ -19,6 +21,14 @@
 //
 // String terms (`contains`/`prefix`) support `ignoreCase=true|false`
 // (or shorthand `ic=t|f`) for per-clause case handling.
+// `contains`/`icontains` also support `any=`/`a=` for pipe-delimited multi-term
+// matching.
+//
+// Omitted values for `contains`/`icontains`/`prefix`/`iprefix` remain
+// field-scoped path assertions (for example `contains{field=/msg}` requires
+// `/msg` to resolve, regardless of terminal value type). Only root/wildcard-any
+// fields such as `/`, `/*`, and `/...` collapse to match-all for empty string
+// terms.
 //
 // Logical composition:
 //

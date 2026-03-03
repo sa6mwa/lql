@@ -102,6 +102,7 @@ sel, _ = lql.ParseSelectorString(`/items[]/sku="ABC-123"`)
 sel, _ = lql.ParseSelectorString(`/items/**/sku="ABC-123"`)
 sel, _ = lql.ParseSelectorString(`/items/.../sku="ABC-123"`)
 sel, _ = lql.ParseSelectorString(`icontains{field=/message,value=timeout}`)
+sel, _ = lql.ParseSelectorString(`contains{field=/message,any=timeout|degraded}`)
 sel, _ = lql.ParseSelectorString(`prefix{field=/service,value=auth,ignoreCase=t}`)
 ```
 
@@ -278,6 +279,10 @@ lql 'contains{field=/msg,value=timeout,ic=t}' data.json
 ```
 
 ```bash
+lql 'contains{field=/msg,any=timeout|degraded},icontains{field=/service,a=AUTH|EDGE}' data.json
+```
+
+```bash
 lql 'icontains{field=/msg,value=timeout},iprefix{field=/service,value=auth}' data.json
 ```
 
@@ -285,9 +290,16 @@ Note: full LQL expressions use `{}` and should be quoted (or the braces
 escaped) to avoid shell brace expansion.
 
 Note: inside `{}`, you can use `f=`/`v=` as aliases for `field=`/`value=`, `a=`
-as an alias for `any=` (in `in{...}` terms), and `ic=` as an alias for
-`ignoreCase=` in string terms (`contains`/`prefix`). `ignoreCase` accepts
-`true/false` or shorthand `t/f`.
+as an alias for `any=` (`in`, `contains`, and `icontains`), and `ic=` as an
+alias for `ignoreCase=` in string terms (`contains`/`prefix`).
+`ignoreCase` accepts `true/false` or shorthand `t/f`.
+
+Note: omitted string values stay field-scoped. For example
+`contains{field=/msg}`, `icontains{field=/msg}`, `prefix{field=/name}`, and
+`iprefix{field=/name}` act as path assertions and require those paths to exist
+(regardless of the terminal value type).
+Only root/wildcard-any forms (such as `field=/`, `field=/*`, `field=/...`)
+collapse to match-all for empty string terms.
 
 SDK (parse full LQL expressions):
 
@@ -324,6 +336,12 @@ sel, err := lql.ParseSelectorString(
 ```go
 sel, err := lql.ParseSelectorString(
   "icontains{field=/msg,value=timeout},iprefix{field=/service,value=auth}",
+)
+```
+
+```go
+sel, err := lql.ParseSelectorString(
+  "contains{field=/msg,any=timeout|degraded},icontains{field=/service,a=AUTH|EDGE}",
 )
 ```
 
@@ -401,6 +419,7 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 
 - Logical: `and`, `or`, `not`
 - Clauses: `eq`, `contains`, `icontains`, `prefix`, `iprefix`, `range`, `in`, `exists`
+- `contains`/`icontains` support `value=` (single term) or `any=`/`a=` (pipe-delimited terms)
 - JSON Pointer fields: `/path/to/field`
 - Shorthand: `/field=value`, `/field!=value`, `/field>=10`, `/field<5`
 - Arrays: `/items/0/sku="ABC-123"`

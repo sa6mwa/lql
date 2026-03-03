@@ -633,7 +633,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Selector examples (full LQL):")
 	fmt.Fprintln(w, "  eq{field=/status,value=open}")
 	fmt.Fprintln(w, "  contains{field=/msg,value=timeout,ic=t}")
+	fmt.Fprintln(w, "  contains{field=/msg,any=timeout|degraded}")
 	fmt.Fprintln(w, "  icontains{field=/msg,value=timeout}")
+	fmt.Fprintln(w, "  icontains{field=/service,a=AUTH|EDGE}")
 	fmt.Fprintln(w, "  iprefix{field=/service,value=auth}")
 	fmt.Fprintln(w, "  and.eq{field=/status,value=open},and.range{field=/progress,gte=50}")
 	fmt.Fprintln(w, "  or.eq{field=/region,value=us},or.eq{field=/region,value=eu}")
@@ -645,6 +647,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Note: with -m, selectors only control which objects are mutated unless -M")
 	fmt.Fprintln(w, "      is used to output only selector matches.")
+	fmt.Fprintln(w, "Note: contains/icontains accept value=... or any=/a=... (pipe-delimited).")
+	fmt.Fprintln(w, "Note: omitted values for contains/icontains/prefix/iprefix act as path assertions.")
 	fmt.Fprintln(w, "Note: mutations apply to a JSON object root, but paths may traverse arrays.")
 }
 

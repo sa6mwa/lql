@@ -77,3 +77,17 @@ func TestInspectSelectorExecutionTraitsEmptySelector(t *testing.T) {
 		t.Fatalf("expected no early non-match heuristic for empty selector")
 	}
 }
+
+func TestInspectSelectorExecutionTraitsStringTermEmptyValue(t *testing.T) {
+	selector, err := ParseSelectorString(`icontains{f=/,v=""}`)
+	if err != nil {
+		t.Fatalf("ParseSelectorString: %v", err)
+	}
+	traits := InspectSelectorExecutionTraits(selector)
+	if traits.RequiresObjectRoot {
+		t.Fatalf("expected match-all selector to allow non-object roots")
+	}
+	if traits.UsesContainsLike {
+		t.Fatalf("expected match-all selector to avoid contains-like traits")
+	}
+}

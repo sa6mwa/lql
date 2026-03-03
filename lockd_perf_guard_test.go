@@ -1,6 +1,7 @@
 package lql
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"os"
@@ -135,6 +136,82 @@ func TestLockdPerfGuardMutateStreamPlan(t *testing.T) {
 	}
 }
 
+func TestLockdPerfGuardContainsAnyBeatsExplicitOr(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping perf guard in short mode")
+	}
+	payload := lockdPerfSyntheticContainsData(4096, 640)
+
+	anySelector, err := ParseSelectorString(`icontains{field=/msg,any=alpha|beta|gamma}`)
+	if err != nil {
+		t.Fatalf("parse contains.any selector: %v", err)
+	}
+	orSelector, err := ParseSelectorString(`or.icontains{field=/msg,value=alpha},or.icontains{field=/msg,value=beta},or.icontains{field=/msg,value=gamma}`)
+	if err != nil {
+		t.Fatalf("parse explicit-or selector: %v", err)
+	}
+
+	anyPlan, err := NewQueryStreamPlan(anySelector)
+	if err != nil {
+		t.Fatalf("query plan contains.any: %v", err)
+	}
+	orPlan, err := NewQueryStreamPlan(orSelector)
+	if err != nil {
+		t.Fatalf("query plan explicit-or: %v", err)
+	}
+	runner := newLockdPerfQueryPlanRunner()
+
+	if err := lockdPerfRunQueryPlan(runner, payload, anyPlan); err != nil {
+		t.Fatalf("contains.any warmup: %v", err)
+	}
+	if err := lockdPerfRunQueryPlan(runner, payload, orPlan); err != nil {
+		t.Fatalf("explicit-or warmup: %v", err)
+	}
+
+	allocRuns := 80
+	anyAllocs := testing.AllocsPerRun(allocRuns, func() {
+		if runErr := lockdPerfRunQueryPlan(runner, payload, anyPlan); runErr != nil {
+			t.Fatalf("contains.any alloc run: %v", runErr)
+		}
+	})
+	orAllocs := testing.AllocsPerRun(allocRuns, func() {
+		if runErr := lockdPerfRunQueryPlan(runner, payload, orPlan); runErr != nil {
+			t.Fatalf("explicit-or alloc run: %v", runErr)
+		}
+	})
+	maxAllocs := lockdPerfGuardFloatEnv("LQL_PERF_GUARD_CONTAINS_ANY_MAX_ALLOCS", 0.10)
+	if anyAllocs > maxAllocs {
+		t.Fatalf("contains.any alloc guard failed: any=%.2f max=%.2f", anyAllocs, maxAllocs)
+	}
+	if orAllocs > maxAllocs {
+		t.Fatalf("explicit-or alloc guard failed: explicit_or=%.2f max=%.2f", orAllocs, maxAllocs)
+	}
+	maxAllocDelta := lockdPerfGuardFloatEnv("LQL_PERF_GUARD_CONTAINS_ANY_MAX_ALLOC_DELTA", 0.25)
+	if anyAllocs > orAllocs+maxAllocDelta {
+		t.Fatalf("contains.any alloc guard failed: any=%.2f explicit_or=%.2f max_delta=%.2f", anyAllocs, orAllocs, maxAllocDelta)
+	}
+
+	loops := int(lockdPerfGuardFloatEnv("LQL_PERF_GUARD_CONTAINS_ANY_THROUGHPUT_LOOPS", 5))
+	if loops < 1 {
+		loops = 1
+	}
+	anyThroughput, err := lockdPerfMeasureQueryThroughput(runner, payload, anyPlan, loops)
+	if err != nil {
+		t.Fatalf("contains.any throughput run: %v", err)
+	}
+	orThroughput, err := lockdPerfMeasureQueryThroughput(runner, payload, orPlan, loops)
+	if err != nil {
+		t.Fatalf("explicit-or throughput run: %v", err)
+	}
+
+	minSpeedup := lockdPerfGuardFloatEnv("LQL_PERF_GUARD_CONTAINS_ANY_MIN_SPEEDUP", 1.10)
+	required := orThroughput * minSpeedup
+	if anyThroughput < required {
+		t.Fatalf("contains.any throughput guard failed: any=%.2f MiB/s explicit_or=%.2f MiB/s min_speedup=%.2fx",
+			anyThroughput, orThroughput, minSpeedup)
+	}
+}
+
 func lockdPerfSyntheticQueryData(count, blobLen int) []byte {
 	var b bytes.Buffer
 	events := []string{"tabs_update", "noop", "heartbeat"}
@@ -161,6 +238,61 @@ func lockdPerfSyntheticMutateData(count, blobLen int) []byte {
 		b.WriteString(`"}`)
 	}
 	return b.Bytes()
+}
+
+func lockdPerfSyntheticContainsData(count, msgLen int) []byte {
+	var b bytes.Buffer
+	msg := strings.Repeat("x", msgLen)
+	for i := 0; i < count; i++ {
+		b.WriteString(`{"msg":"`)
+		b.WriteString(msg)
+		b.WriteString(`","idx":`)
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(`}`)
+		b.WriteByte('\n')
+	}
+	return b.Bytes()
+}
+
+type lockdPerfQueryPlanRunner struct {
+	src    bytes.Reader
+	reader *bufio.Reader
+}
+
+func newLockdPerfQueryPlanRunner() *lockdPerfQueryPlanRunner {
+	runner := &lockdPerfQueryPlanRunner{}
+	runner.reader = bufio.NewReaderSize(&runner.src, 64*1024)
+	return runner
+}
+
+func (r *lockdPerfQueryPlanRunner) run(payload []byte, plan QueryStreamPlan) error {
+	r.src.Reset(payload)
+	r.reader.Reset(&r.src)
+	_, err := QueryStreamWithResult(QueryStreamRequest{
+		Reader: r.reader,
+		Plan:   plan,
+		Mode:   QueryDecisionOnly,
+		OnDecision: func(QueryStreamDecision) error {
+			return nil
+		},
+	})
+	return err
+}
+
+func lockdPerfRunQueryPlan(runner *lockdPerfQueryPlanRunner, payload []byte, plan QueryStreamPlan) error {
+	return runner.run(payload, plan)
+}
+
+func lockdPerfMeasureQueryThroughput(runner *lockdPerfQueryPlanRunner, payload []byte, plan QueryStreamPlan, loops int) (float64, error) {
+	start := time.Now()
+	for i := 0; i < loops; i++ {
+		if err := lockdPerfRunQueryPlan(runner, payload, plan); err != nil {
+			return 0, err
+		}
+	}
+	elapsed := time.Since(start)
+	throughput := (float64(len(payload)*loops) / (1024 * 1024)) / elapsed.Seconds()
+	return throughput, nil
 }
 
 func lockdPerfGuardFloatEnv(name string, fallback float64) float64 {

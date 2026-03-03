@@ -11,6 +11,7 @@ func Matches(sel Selector, doc map[string]any) bool {
 	if doc == nil {
 		return false
 	}
+	sel = simplifySelector(sel)
 	return matchSelector(sel, doc)
 }
 
@@ -111,10 +112,21 @@ func matchStringTerm(term *Term, doc map[string]any, matcher func(string, string
 	if !ok {
 		return false
 	}
+	// Omitted value acts as a path assertion for string-term selectors.
+	if len(term.Any) == 0 && !term.valueSet && term.Value == "" {
+		return true
+	}
 	ignoreCase := forceIgnoreCase || term.IgnoreCase
-	needle := term.Value
+	needles := make([]string, 0, 1+len(term.Any))
+	if len(term.Any) > 0 {
+		needles = append(needles, term.Any...)
+	} else {
+		needles = append(needles, term.Value)
+	}
 	if ignoreCase {
-		needle = strings.ToLower(needle)
+		for i := range needles {
+			needles[i] = strings.ToLower(needles[i])
+		}
 	}
 	for _, value := range values {
 		str, ok := valueToString(value)
@@ -124,8 +136,10 @@ func matchStringTerm(term *Term, doc map[string]any, matcher func(string, string
 		if ignoreCase {
 			str = strings.ToLower(str)
 		}
-		if matcher(str, needle) {
-			return true
+		for _, needle := range needles {
+			if matcher(str, needle) {
+				return true
+			}
 		}
 	}
 	return false

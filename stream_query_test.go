@@ -115,6 +115,164 @@ func TestQueryStreamNonObjectDoesNotMatchNonEmptySelector(t *testing.T) {
 	}
 }
 
+func TestQueryStreamStringTermEmptyValueMatchesAllLikeEmptySelector(t *testing.T) {
+	selector, err := ParseSelectorString(`icontains{f=/,v=""}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+
+	input := strings.NewReader(`"x"
+{"id":"x"}
+123`)
+
+	var matches []bool
+	err = QueryStream(QueryStreamRequest{
+		Reader:      input,
+		Selector:    selector,
+		IncludeJSON: false,
+		OnValue: func(value QueryStreamValue) error {
+			matches = append(matches, value.Matched)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("query stream: %v", err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("expected 3 candidates, got %d", len(matches))
+	}
+	if !matches[0] || !matches[1] || !matches[2] {
+		t.Fatalf("expected all candidates to match, got %+v", matches)
+	}
+}
+
+func TestQueryStreamStringTermOmittedValueActsAsPathAssertionForAllStringSelectors(t *testing.T) {
+	inputData := `{"hello":{"world":{"nested":true}}}
+{"hello":{"world":[1,2,3]}}
+{"hello":{"world":null}}
+{"hello":{"other":"x"}}`
+	cases := []struct {
+		expr     string
+		expected []bool
+	}{
+		{expr: `contains{f=/hello/world}`, expected: []bool{true, true, true, false}},
+		{expr: `icontains{f=/hello/world}`, expected: []bool{true, true, true, false}},
+		{expr: `prefix{f=/hello/world}`, expected: []bool{true, true, true, false}},
+		{expr: `iprefix{f=/hello/world}`, expected: []bool{true, true, true, false}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.expr, func(t *testing.T) {
+			selector, err := ParseSelectorString(tc.expr)
+			if err != nil {
+				t.Fatalf("parse selector: %v", err)
+			}
+			var matches []bool
+			err = QueryStream(QueryStreamRequest{
+				Reader:      strings.NewReader(inputData),
+				Selector:    selector,
+				IncludeJSON: false,
+				OnValue: func(value QueryStreamValue) error {
+					matches = append(matches, value.Matched)
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("query stream: %v", err)
+			}
+			if len(matches) != len(tc.expected) {
+				t.Fatalf("expected %d candidates, got %d", len(tc.expected), len(matches))
+			}
+			for i := range tc.expected {
+				if matches[i] != tc.expected[i] {
+					t.Fatalf("candidate %d expected %v got %v", i, tc.expected[i], matches[i])
+				}
+			}
+		})
+	}
+}
+
+func TestQueryStreamStringTermOmittedValuePathVariants(t *testing.T) {
+	input := strings.NewReader(`{"hello":{"world":{"nested":true},"names":["alice","bob"]},"arrays":[{"id":1},{"id":2}]}
+{"hello":{"other":"x"},"arrays":[]}`)
+
+	selector, err := ParseSelectorString(`and.contains{f=/hello/*},and.contains{f=/hello/...},and.contains{f=/arrays/[]},and.contains{f=/arrays/[]/id}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+
+	var matches []bool
+	err = QueryStream(QueryStreamRequest{
+		Reader:      input,
+		Selector:    selector,
+		IncludeJSON: false,
+		OnValue: func(value QueryStreamValue) error {
+			matches = append(matches, value.Matched)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("query stream: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(matches))
+	}
+	if !matches[0] || matches[1] {
+		t.Fatalf("expected variant assertion matches [true false], got %+v", matches)
+	}
+}
+
+func TestQueryStreamContainsAnyEquivalentToExplicitOr(t *testing.T) {
+	anySelector, err := ParseSelectorString(`contains{f=/msg,a=warn|timeout}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	orSelector, err := ParseSelectorString(`or.contains{f=/msg,v=warn},or.contains{f=/msg,v=timeout}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+
+	input := strings.NewReader(`{"msg":"warn: cache miss"}
+{"msg":"timeout waiting for reply"}
+{"msg":"ok"}
+42`)
+	run := func(selector Selector) ([]bool, error) {
+		var matches []bool
+		err := QueryStream(QueryStreamRequest{
+			Reader:      input,
+			Selector:    selector,
+			IncludeJSON: false,
+			OnValue: func(value QueryStreamValue) error {
+				matches = append(matches, value.Matched)
+				return nil
+			},
+		})
+		return matches, err
+	}
+
+	anyMatches, err := run(anySelector)
+	if err != nil {
+		t.Fatalf("query stream any selector: %v", err)
+	}
+	input.Reset(`{"msg":"warn: cache miss"}
+{"msg":"timeout waiting for reply"}
+{"msg":"ok"}
+42`)
+	orMatches, err := run(orSelector)
+	if err != nil {
+		t.Fatalf("query stream or selector: %v", err)
+	}
+	if len(anyMatches) != len(orMatches) {
+		t.Fatalf("result length mismatch any=%d or=%d", len(anyMatches), len(orMatches))
+	}
+	for i := range anyMatches {
+		if anyMatches[i] != orMatches[i] {
+			t.Fatalf("result mismatch at %d any=%v or=%v", i, anyMatches[i], orMatches[i])
+		}
+	}
+}
+
 func TestQueryStreamWildcardAndExists(t *testing.T) {
 	selector, err := ParseSelectorString(`and.eq{field=/items[]/sku,value=B},and.exists{/meta/etag}`)
 	if err != nil {

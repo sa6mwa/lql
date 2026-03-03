@@ -38,17 +38,20 @@ func (s Selector) IsEmpty() bool {
 
 // Term represents a simple field/value predicate.
 type Term struct {
-	Field      string `json:"field"`
-	Value      string `json:"value"`
-	IgnoreCase bool   `json:"ignoreCase,omitempty"`
+	Field      string   `json:"field"`
+	Value      string   `json:"value"`
+	Any        []string `json:"any,omitempty"`
+	IgnoreCase bool     `json:"ignoreCase,omitempty"`
+	valueSet   bool
 }
 
 // UnmarshalJSON accepts string/bool/number for value and converts to string.
 func (t *Term) UnmarshalJSON(data []byte) error {
 	type alias struct {
-		Field      string      `json:"field"`
-		Value      interface{} `json:"value"`
-		IgnoreCase interface{} `json:"ignoreCase,omitempty"`
+		Field      string          `json:"field"`
+		Value      json.RawMessage `json:"value"`
+		Any        json.RawMessage `json:"any,omitempty"`
+		IgnoreCase interface{}     `json:"ignoreCase,omitempty"`
 	}
 	var tmp alias
 	if err := json.Unmarshal(data, &tmp); err != nil {
@@ -58,21 +61,22 @@ func (t *Term) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("term field required")
 	}
 	t.Field = tmp.Field
-	switch v := tmp.Value.(type) {
-	case string:
-		t.Value = v
-	case bool:
-		if v {
-			t.Value = "true"
-		} else {
-			t.Value = "false"
+	t.Value = ""
+	t.Any = nil
+	t.valueSet = len(tmp.Value) > 0
+	if t.valueSet {
+		value, err := parseTermValueRaw(tmp.Value)
+		if err != nil {
+			return err
 		}
-	case float64:
-		t.Value = strconv.FormatFloat(v, 'f', -1, 64)
-	case nil:
-		t.Value = ""
-	default:
-		t.Value = fmt.Sprint(v)
+		t.Value = value
+	}
+	if len(tmp.Any) > 0 {
+		any, err := parseTermAnyRaw(tmp.Any)
+		if err != nil {
+			return err
+		}
+		t.Any = any
 	}
 	if tmp.IgnoreCase != nil {
 		ignoreCase, err := parseIgnoreCaseValue(tmp.IgnoreCase)
@@ -82,6 +86,66 @@ func (t *Term) UnmarshalJSON(data []byte) error {
 		t.IgnoreCase = ignoreCase
 	}
 	return nil
+}
+
+func parseTermValueRaw(raw json.RawMessage) (string, error) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", err
+	}
+	return termValueToString(value), nil
+}
+
+func parseTermAnyRaw(raw json.RawMessage) ([]string, error) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, err
+	}
+	switch v := value.(type) {
+	case string:
+		any, err := parseInAny(v)
+		if err != nil {
+			return nil, fmt.Errorf("term any requires values")
+		}
+		return any, nil
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, candidate := range v {
+			item := strings.TrimSpace(termValueToString(candidate))
+			if item == "" {
+				continue
+			}
+			out = append(out, item)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("term any requires values")
+		}
+		return out, nil
+	default:
+		item := strings.TrimSpace(termValueToString(v))
+		if item == "" {
+			return nil, fmt.Errorf("term any requires values")
+		}
+		return []string{item}, nil
+	}
+}
+
+func termValueToString(v any) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	case bool:
+		if value {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(value)
+	}
 }
 
 func parseIgnoreCaseValue(v any) (bool, error) {

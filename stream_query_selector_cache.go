@@ -113,6 +113,10 @@ func hashTerm(h *uint64, term *Term) {
 	hashByte(h, 1)
 	hashString(h, term.Field)
 	hashString(h, term.Value)
+	hashByte(h, byte(len(term.Any)))
+	for i := range term.Any {
+		hashString(h, term.Any[i])
+	}
 	if term.IgnoreCase {
 		hashByte(h, 1)
 	} else {
@@ -218,7 +222,15 @@ func termEqual(a, b *Term) bool {
 	if a == nil {
 		return true
 	}
-	return a.Field == b.Field && a.Value == b.Value && a.IgnoreCase == b.IgnoreCase
+	if a.Field != b.Field || a.Value != b.Value || a.IgnoreCase != b.IgnoreCase || len(a.Any) != len(b.Any) {
+		return false
+	}
+	for i := range a.Any {
+		if a.Any[i] != b.Any[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func rangeTermEqual(a, b *RangeTerm) bool {
@@ -298,6 +310,9 @@ func cloneTerm(term *Term) *Term {
 		return nil
 	}
 	clone := *term
+	if len(term.Any) > 0 {
+		clone.Any = append(make([]string, 0, len(term.Any)), term.Any...)
+	}
 	return &clone
 }
 

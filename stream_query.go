@@ -1416,6 +1416,9 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 			break
 		}
 	}
+	if needTerm {
+		s.fastTopLevelMarkTermExists(field)
+	}
 
 	var candidate string
 	hasCandidate := false
@@ -1549,12 +1552,26 @@ func (s *streamScanState) fastTopLevelMarkExists(field *streamFastTopLevelField)
 	}
 }
 
+func (s *streamScanState) fastTopLevelMarkTermExists(field *streamFastTopLevelField) {
+	for _, idx := range field.termIdxs {
+		clause := &s.engine.termClauses[idx]
+		if s.engine.hits[clause.id] || !clause.existsOnly {
+			continue
+		}
+		s.engine.hits[clause.id] = true
+	}
+}
+
 func (s *streamScanState) fastTopLevelMatchTerms(field *streamFastTopLevelField, candidate string) {
 	lowerCandidate := ""
 	haveLower := false
 	for _, idx := range field.termIdxs {
 		clause := &s.engine.termClauses[idx]
 		if s.engine.hits[clause.id] {
+			continue
+		}
+		if clause.existsOnly {
+			s.engine.hits[clause.id] = true
 			continue
 		}
 		value := candidate
@@ -1565,14 +1582,37 @@ func (s *streamScanState) fastTopLevelMatchTerms(field *streamFastTopLevelField,
 			}
 			value = lowerCandidate
 		}
-		switch clause.mode {
-		case streamTermEq:
-			s.engine.hits[clause.id] = value == clause.needle
-		case streamTermContains:
-			s.engine.hits[clause.id] = strings.Contains(value, clause.needle)
-		case streamTermPrefix:
-			s.engine.hits[clause.id] = strings.HasPrefix(value, clause.needle)
+		s.engine.hits[clause.id] = streamTermClauseMatchesString(clause, value)
+	}
+}
+
+func streamTermClauseMatchesString(clause *streamTermClause, candidate string) bool {
+	if clause == nil {
+		return false
+	}
+	if clause.existsOnly {
+		return true
+	}
+	switch clause.mode {
+	case streamTermEq:
+		return candidate == clause.needle
+	case streamTermContains:
+		if clause.containsAC != nil {
+			state := 0
+			for i := 0; i < len(candidate); i++ {
+				nextState, matched := clause.containsAC.advance(state, candidate[i])
+				state = nextState
+				if matched {
+					return true
+				}
+			}
+			return false
 		}
+		return strings.Contains(candidate, clause.needle)
+	case streamTermPrefix:
+		return strings.HasPrefix(candidate, clause.needle)
+	default:
+		return false
 	}
 }
 
@@ -1928,7 +1968,7 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 		matcher := streamStringTermMatcher{clause: clause}
 		switch clause.mode {
 		case streamTermContains:
-			if len(clause.needleBytes) == 0 {
+			if clause.containsAC == nil && len(clause.needleBytes) == 0 {
 				matcher.matched = true
 			}
 		case streamTermPrefix:
@@ -2120,10 +2160,22 @@ func (s *streamScanState) streamMatchSingleTermClause(reader *streamByteReader, 
 	}
 
 	containsPos := 0
-	containsMatched := clause.mode == streamTermContains && len(needle) == 0
+	containsACPos := 0
+	containsMatched := clause.mode == streamTermContains && clause.containsAC == nil && len(needle) == 0
 
 	feedContainsByte := func(b byte) {
-		if containsMatched || len(needle) == 0 {
+		if containsMatched {
+			return
+		}
+		if clause.containsAC != nil {
+			nextState, matched := clause.containsAC.advance(containsACPos, b)
+			containsACPos = nextState
+			if matched {
+				containsMatched = true
+			}
+			return
+		}
+		if len(needle) == 0 {
 			return
 		}
 		for containsPos > 0 && b != needle[containsPos] {
@@ -2189,7 +2241,19 @@ func (s *streamScanState) streamMatchSingleTermClause(reader *streamByteReader, 
 				}
 				prefixPos += len(segment)
 			case streamTermContains:
-				if containsMatched || len(needle) == 0 {
+				if containsMatched {
+					return
+				}
+				if clause.containsAC != nil {
+					for _, b := range segment {
+						feedContainsByte(b)
+						if containsMatched {
+							return
+						}
+					}
+					return
+				}
+				if len(needle) == 0 {
 					return
 				}
 				if containsPos == 0 {
@@ -2216,7 +2280,20 @@ func (s *streamScanState) streamMatchSingleTermClause(reader *streamByteReader, 
 			return
 		}
 		if clause.mode == streamTermContains {
-			if containsMatched || len(needle) == 0 {
+			if containsMatched {
+				return
+			}
+			if clause.containsAC != nil {
+				lowerSegment := s.lowerASCIIBytes(segment)
+				for _, b := range lowerSegment {
+					feedContainsByte(b)
+					if containsMatched {
+						return
+					}
+				}
+				return
+			}
+			if len(needle) == 0 {
 				return
 			}
 			lowerSegment := s.lowerASCIIBytes(segment)
@@ -2750,7 +2827,18 @@ func (m *streamStringTermMatcher) feedByte(b byte) {
 		}
 		m.eqMismatch = true
 	case streamTermContains:
-		if m.matched || len(needle) == 0 {
+		if m.matched {
+			return
+		}
+		if m.clause.containsAC != nil {
+			nextState, matched := m.clause.containsAC.advance(m.containsAC, b)
+			m.containsAC = nextState
+			if matched {
+				m.matched = true
+			}
+			return
+		}
+		if len(needle) == 0 {
 			return
 		}
 		for m.containsPos > 0 && b != needle[m.containsPos] {
@@ -2785,6 +2873,9 @@ func (m *streamStringTermMatcher) finalMatch() bool {
 	case streamTermEq:
 		return !m.eqMismatch && m.eqPos == len(needle)
 	case streamTermContains:
+		if m.clause.containsAC != nil {
+			return m.matched
+		}
 		return len(needle) == 0 || m.matched
 	case streamTermPrefix:
 		if len(needle) == 0 {
@@ -3295,6 +3386,98 @@ func buildKMPPrefixTable(pattern []byte) []int {
 	return lps
 }
 
+func buildStreamContainsAutomaton(needles [][]byte) *streamContainsAutomaton {
+	if len(needles) == 0 {
+		return nil
+	}
+	newState := func() ([]int, bool) {
+		transitions := make([]int, 256)
+		for i := range transitions {
+			transitions[i] = -1
+		}
+		return transitions, false
+	}
+
+	next := make([][]int, 0, 16)
+	accept := make([]bool, 0, 16)
+	addState := func() int {
+		transitions, terminal := newState()
+		next = append(next, transitions)
+		accept = append(accept, terminal)
+		return len(next) - 1
+	}
+	addState() // root
+
+	for _, needle := range needles {
+		if len(needle) == 0 {
+			accept[0] = true
+			continue
+		}
+		state := 0
+		for _, b := range needle {
+			nextState := next[state][b]
+			if nextState < 0 {
+				nextState = addState()
+				next[state][b] = nextState
+			}
+			state = nextState
+		}
+		accept[state] = true
+	}
+
+	fail := make([]int, len(next))
+	queue := make([]int, 0, len(next))
+	for c := 0; c < 256; c++ {
+		child := next[0][byte(c)]
+		if child < 0 {
+			next[0][byte(c)] = 0
+			continue
+		}
+		fail[child] = 0
+		queue = append(queue, child)
+	}
+
+	for len(queue) > 0 {
+		state := queue[0]
+		queue = queue[1:]
+		if accept[fail[state]] {
+			accept[state] = true
+		}
+		for c := 0; c < 256; c++ {
+			b := byte(c)
+			child := next[state][b]
+			if child < 0 {
+				next[state][b] = next[fail[state]][b]
+				continue
+			}
+			fail[child] = next[fail[state]][b]
+			if accept[fail[child]] {
+				accept[child] = true
+			}
+			queue = append(queue, child)
+		}
+	}
+
+	return &streamContainsAutomaton{
+		next:   next,
+		accept: accept,
+	}
+}
+
+func (a *streamContainsAutomaton) advance(state int, b byte) (int, bool) {
+	if a == nil || len(a.next) == 0 {
+		return state, false
+	}
+	if state < 0 || state >= len(a.next) {
+		state = 0
+	}
+	nextState := a.next[state][b]
+	if nextState < 0 || nextState >= len(a.accept) {
+		nextState = 0
+	}
+	return nextState, a.accept[nextState]
+}
+
 func (s *streamScanState) readNumber(reader *streamByteReader, first byte) ([]byte, error) {
 	s.numberBuf = s.numberBuf[:0]
 	i := 0
@@ -3761,11 +3944,12 @@ type streamSelectorEngine struct {
 	inIDs     map[*InTerm]int
 	existsIDs map[string]int
 
-	hasTermClauses   bool
-	hasRangeClauses  bool
-	hasInClauses     bool
-	hasExistsClauses bool
-	useDispatch      bool
+	hasTermClauses           bool
+	hasExistsLikeTermClauses bool
+	hasRangeClauses          bool
+	hasInClauses             bool
+	hasExistsClauses         bool
+	useDispatch              bool
 
 	fastEq          *streamFastEqClause
 	fastRecursiveEq *streamFastRecursiveEqClause
@@ -3858,7 +4042,14 @@ type streamTermClause struct {
 	needle          string
 	needleBytes     []byte
 	containsLPS     []int
+	containsAC      *streamContainsAutomaton
 	ignoreCase      bool
+	existsOnly      bool
+}
+
+type streamContainsAutomaton struct {
+	next   [][]int
+	accept []bool
 }
 
 type streamRangeClause struct {
@@ -3905,6 +4096,7 @@ type streamStringTermMatcher struct {
 	prefixPos   int
 	prefixDone  bool
 	containsPos int
+	containsAC  int
 	eqPos       int
 	eqMismatch  bool
 	matched     bool
@@ -4002,6 +4194,7 @@ func (p *streamFastTopLevelProgram) ensureField(key string) *streamFastTopLevelF
 }
 
 func newStreamSelectorEngine(selector Selector) (*streamSelectorEngine, error) {
+	selector = simplifySelector(selector)
 	engine := &streamSelectorEngine{
 		selector:      selector,
 		emptySelector: selector.IsEmpty(),
@@ -4320,14 +4513,42 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 	e.termIDs[term] = id
 	hasRecursive, singleRecursive, recursiveIdx := streamPatternRecursiveInfo(tokens)
 	tailKind, tailKey, tailIndex := streamPatternTailFilter(tokens)
-	needle := term.Value
 	ignoreCase := forceIgnoreCase || term.IgnoreCase
+	existsOnly := mode != streamTermEq && len(term.Any) == 0 && !term.valueSet && term.Value == ""
+	needle := term.Value
 	if ignoreCase {
 		needle = strings.ToLower(needle)
 	}
 	needleBytes := []byte(needle)
+	var containsAC *streamContainsAutomaton
+	if len(term.Any) > 0 {
+		if mode != streamTermContains {
+			return fmt.Errorf("selector term any only supported for contains")
+		}
+		normalizedAny := make([][]byte, 0, len(term.Any))
+		seen := make(map[string]struct{}, len(term.Any))
+		for _, candidate := range term.Any {
+			value := candidate
+			if ignoreCase {
+				value = strings.ToLower(value)
+			}
+			if _, exists := seen[value]; exists {
+				continue
+			}
+			seen[value] = struct{}{}
+			normalizedAny = append(normalizedAny, []byte(value))
+		}
+		if len(normalizedAny) == 1 {
+			needleBytes = normalizedAny[0]
+			needle = string(needleBytes)
+		} else if len(normalizedAny) > 1 {
+			needle = ""
+			needleBytes = nil
+			containsAC = buildStreamContainsAutomaton(normalizedAny)
+		}
+	}
 	var containsLPS []int
-	if mode == streamTermContains && len(needleBytes) > 0 {
+	if mode == streamTermContains && containsAC == nil && len(needleBytes) > 0 {
 		containsLPS = buildKMPPrefixTable(needleBytes)
 	}
 	e.termClauses = append(e.termClauses, streamTermClause{
@@ -4344,10 +4565,15 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 		needle:          needle,
 		needleBytes:     needleBytes,
 		containsLPS:     containsLPS,
+		containsAC:      containsAC,
 		ignoreCase:      ignoreCase,
+		existsOnly:      existsOnly,
 	})
 	e.termDispatch.add(tailKind, tailKey, tailIndex, len(e.termClauses)-1)
 	e.hasTermClauses = true
+	if existsOnly {
+		e.hasExistsLikeTermClauses = true
+	}
 	return nil
 }
 
@@ -4495,12 +4721,15 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 	}
 	switch kind {
 	case streamValueObject, streamValueArray:
-		if !e.hasExistsClauses {
+		if !e.hasExistsClauses && !e.hasExistsLikeTermClauses {
 			return
 		}
 	case streamValueNull:
-		// Null never satisfies eq/in/range clauses and exists only matches non-null.
-		return
+		// Null never satisfies eq/in/range clauses and exists only matches non-null,
+		// but omitted string-term values can still assert path presence.
+		if !e.hasExistsLikeTermClauses {
+			return
+		}
 	case streamValueBool:
 		if !e.hasTermClauses && !e.hasInClauses && !e.hasExistsClauses {
 			return
@@ -4533,6 +4762,10 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 			if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				continue
 			}
+			if clause.existsOnly {
+				e.hits[clause.id] = true
+				continue
+			}
 			if !stringCacheReady {
 				stringCached, stringCachedOK = valueToString(value)
 				stringCacheReady = true
@@ -4548,20 +4781,17 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 				}
 				candidate = lowerStringCached
 			}
-			switch clause.mode {
-			case streamTermEq:
-				e.hits[clause.id] = candidate == clause.needle
-			case streamTermContains:
-				e.hits[clause.id] = strings.Contains(candidate, clause.needle)
-			case streamTermPrefix:
-				e.hits[clause.id] = strings.HasPrefix(candidate, clause.needle)
-			}
+			e.hits[clause.id] = streamTermClauseMatchesString(clause, candidate)
 		}
 		for _, clauseIdx := range termAny {
 			clause := &e.termClauses[clauseIdx]
 			if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				continue
 			}
+			if clause.existsOnly {
+				e.hits[clause.id] = true
+				continue
+			}
 			if !stringCacheReady {
 				stringCached, stringCachedOK = valueToString(value)
 				stringCacheReady = true
@@ -4577,14 +4807,7 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 				}
 				candidate = lowerStringCached
 			}
-			switch clause.mode {
-			case streamTermEq:
-				e.hits[clause.id] = candidate == clause.needle
-			case streamTermContains:
-				e.hits[clause.id] = strings.Contains(candidate, clause.needle)
-			case streamTermPrefix:
-				e.hits[clause.id] = strings.HasPrefix(candidate, clause.needle)
-			}
+			e.hits[clause.id] = streamTermClauseMatchesString(clause, candidate)
 		}
 
 		rangeSpecific, rangeAny := e.rangeDispatch.candidates(path, keyBytes)
@@ -4703,6 +4926,10 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 			continue
 		}
+		if clause.existsOnly {
+			e.hits[clause.id] = true
+			continue
+		}
 		if !stringCacheReady {
 			stringCached, stringCachedOK = valueToString(value)
 			stringCacheReady = true
@@ -4718,14 +4945,7 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 			}
 			candidate = lowerStringCached
 		}
-		switch clause.mode {
-		case streamTermEq:
-			e.hits[clause.id] = candidate == clause.needle
-		case streamTermContains:
-			e.hits[clause.id] = strings.Contains(candidate, clause.needle)
-		case streamTermPrefix:
-			e.hits[clause.id] = strings.HasPrefix(candidate, clause.needle)
-		}
+		e.hits[clause.id] = streamTermClauseMatchesString(clause, candidate)
 	}
 
 	for i := range e.rangeClauses {
@@ -4897,6 +5117,9 @@ func (e *streamSelectorEngine) stringValueNeeded(path []streamPathSegment, keyBy
 			if e.hits[clause.id] {
 				continue
 			}
+			if clause.existsOnly {
+				continue
+			}
 			if streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				return true
 			}
@@ -4904,6 +5127,9 @@ func (e *streamSelectorEngine) stringValueNeeded(path []streamPathSegment, keyBy
 		for _, clauseIdx := range termAny {
 			clause := &e.termClauses[clauseIdx]
 			if e.hits[clause.id] {
+				continue
+			}
+			if clause.existsOnly {
 				continue
 			}
 			if streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
@@ -4956,6 +5182,9 @@ func (e *streamSelectorEngine) stringValueNeeded(path []streamPathSegment, keyBy
 	for i := range e.termClauses {
 		clause := &e.termClauses[i]
 		if e.hits[clause.id] {
+			continue
+		}
+		if clause.existsOnly {
 			continue
 		}
 		if streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) &&

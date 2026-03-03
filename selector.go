@@ -312,7 +312,14 @@ func parseSelectorValuesInternal(values url.Values) (Selector, bool, error) {
 	if !found {
 		return Selector{}, false, nil
 	}
-	return builder.build()
+	selector, ok, err := builder.build()
+	if err != nil {
+		return Selector{}, false, err
+	}
+	if !ok {
+		return Selector{}, false, nil
+	}
+	return simplifySelector(selector), true, nil
 }
 
 func firstSelectorToken(raw string) string {
@@ -720,6 +727,9 @@ func selectorFromClause(clause *clauseBuilder) (Selector, bool, error) {
 	}
 	var selector Selector
 	if err := json.Unmarshal(payload, &selector); err != nil {
+		return Selector{}, false, err
+	}
+	if err := validateSelectorSemantics(selector); err != nil {
 		return Selector{}, false, err
 	}
 	return selector, true, nil
