@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestQueryStreamNDJSONMatches(t *testing.T) {
@@ -273,6 +274,116 @@ func TestQueryStreamContainsAnyEquivalentToExplicitOr(t *testing.T) {
 	}
 }
 
+func TestQueryStreamDateOnlyEqIntersectsTimestamp(t *testing.T) {
+	selector, err := ParseSelectorString(`/something="2025-01-01"`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+
+	input := strings.NewReader(`{"something":"2025-01-01T15:00:00Z"}
+{"something":"2025-01-02T00:00:00Z"}`)
+	var matches []bool
+	err = QueryStream(QueryStreamRequest{
+		Reader:      input,
+		Selector:    selector,
+		IncludeJSON: false,
+		OnValue: func(value QueryStreamValue) error {
+			matches = append(matches, value.Matched)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("query stream: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(matches))
+	}
+	if !matches[0] || matches[1] {
+		t.Fatalf("unexpected date eq matches: %+v", matches)
+	}
+}
+
+func TestQueryStreamDateSelectorSinceNowMacro(t *testing.T) {
+	now := time.Now()
+	selector, err := ParseSelectorString(`date{f=/something,since=now}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+	input := strings.NewReader(fmt.Sprintf(
+		`{"something":%q}
+{"something":%q}`,
+		now.Add(2*time.Minute).Format(time.RFC3339Nano),
+		now.Add(-2*time.Minute).Format(time.RFC3339Nano),
+	))
+	var matches []bool
+	err = QueryStream(QueryStreamRequest{
+		Reader:      input,
+		Selector:    selector,
+		IncludeJSON: false,
+		OnValue: func(value QueryStreamValue) error {
+			matches = append(matches, value.Matched)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("query stream: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(matches))
+	}
+	if !matches[0] || matches[1] {
+		t.Fatalf("unexpected date since matches: %+v", matches)
+	}
+}
+
+func TestQueryStreamDateSelectorSinceNowMacroRefreshesPerRun(t *testing.T) {
+	selector, err := ParseSelectorString(`date{f=/something,since=now}`)
+	if err != nil {
+		t.Fatalf("parse selector: %v", err)
+	}
+
+	baseNow := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	currentNow := baseNow
+	prevNow := queryStreamNow
+	queryStreamNow = func() time.Time { return currentNow }
+	defer func() {
+		queryStreamNow = prevNow
+	}()
+
+	plan, err := NewQueryStreamPlan(selector)
+	if err != nil {
+		t.Fatalf("new query stream plan: %v", err)
+	}
+
+	candidate := baseNow.Add(30 * time.Minute).Format(time.RFC3339Nano)
+	input := fmt.Sprintf(`{"something":%q}`, candidate)
+	run := func() bool {
+		matched := false
+		runErr := QueryStream(QueryStreamRequest{
+			Reader: strings.NewReader(input),
+			Plan:   plan,
+			Mode:   QueryDecisionOnly,
+			OnValue: func(value QueryStreamValue) error {
+				matched = value.Matched
+				return nil
+			},
+		})
+		if runErr != nil {
+			t.Fatalf("query stream: %v", runErr)
+		}
+		return matched
+	}
+
+	if !run() {
+		t.Fatalf("expected candidate to match initial since=now cutoff")
+	}
+
+	currentNow = baseNow.Add(2 * time.Hour)
+	if run() {
+		t.Fatalf("expected candidate to miss after since=now cutoff refresh")
+	}
+}
+
 func TestQueryStreamWildcardAndExists(t *testing.T) {
 	selector, err := ParseSelectorString(`and.eq{field=/items[]/sku,value=B},and.exists{/meta/etag}`)
 	if err != nil {
@@ -370,14 +481,13 @@ func TestQueryStreamPlanParity(t *testing.T) {
 }
 
 func TestNewStreamSelectorEngineBuildsFastTopLevelProgram(t *testing.T) {
-	gte := 10.0
 	selector := Selector{
 		Or: []Selector{
 			{Eq: &Term{Field: "/status", Value: "open"}},
 			{Eq: &Term{Field: "/status", Value: "closed"}},
 		},
 		Not:    &Selector{Eq: &Term{Field: "/region", Value: "apac"}},
-		Range:  &RangeTerm{Field: "/latency", GTE: &gte},
+		Range:  &RangeTerm{Field: "/latency", GTE: NewNumericRangeBound(10)},
 		In:     &InTerm{Field: "/env", Any: []string{"prod", "stage"}},
 		Exists: "/meta",
 	}
@@ -400,6 +510,28 @@ func TestNewStreamSelectorEngineSkipsFastTopLevelProgramForNestedPaths(t *testin
 	}
 	if engine.fastTopLevel != nil {
 		t.Fatalf("expected fast top-level program to be disabled for nested paths")
+	}
+}
+
+func TestNewStreamSelectorEngineBuildsFastTopLevelProgramForTemporalClauses(t *testing.T) {
+	selector := Selector{
+		Eq: &Term{Field: "/timestamp", Value: "2025-01-01"},
+		Range: &RangeTerm{
+			Field: "/created_at",
+			GTE:   NewDatetimeRangeBound("2026-03-05T10:28:21Z"),
+		},
+		Date: &DateTerm{
+			Field:  "/updated_at",
+			After:  "2026-03-05T10:28:21Z",
+			Before: "2026-03-05T10:29:50Z",
+		},
+	}
+	engine, err := newStreamSelectorEngine(selector)
+	if err != nil {
+		t.Fatalf("new stream selector engine: %v", err)
+	}
+	if engine.fastTopLevel == nil {
+		t.Fatalf("expected fast top-level program for top-level temporal clauses")
 	}
 }
 

@@ -2,6 +2,7 @@ package lql
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -31,6 +32,12 @@ func FuzzParseSelectorString(f *testing.F) {
 		"in{field=/env,any=prod|stage}",
 		"in{f=/env,a=prod|stage|dev}",
 		"range{field=/latency,gte=50,lte=300}",
+		`/timestamp="2026-03-05"`,
+		`/timestamp>=2026-03-05T10:28:21Z`,
+		`range{field=/timestamp,gte=2026-03-05T10:28:21Z,lt=2026-03-05T10:30:00Z}`,
+		`date{field=/timestamp,after=2026-03-05T10:28:21Z,before=2026-03-05T10:30:00Z}`,
+		`date{f=/timestamp,a=2026-03-05T10:28:21Z,b=2026-03-05T10:30:00Z}`,
+		`date{f=/timestamp,since=yesterday}`,
 		"exists{/meta/etag}",
 		"exists{/items/**/sku}",
 		"/items[]/sku=\"B\"",
@@ -81,7 +88,7 @@ func FuzzParseSelectorShorthand(f *testing.F) {
 			field = "/fuzz"
 		}
 		op := ops[int(opIdx)%len(ops)]
-		literal := buildFuzzLiteral(op, value)
+		literal := buildFuzzLiteral(op, value, opIdx)
 		expr := field + op + literal
 		_, _ = ParseSelectorString(expr)
 	})
@@ -103,19 +110,33 @@ func sanitizeFuzzField(in string) string {
 	return strings.Map(replacer, trimmed)
 }
 
-func buildFuzzLiteral(op string, value string) string {
+func buildFuzzLiteral(op string, value string, opIdx uint8) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		trimmed = "seed"
 	}
 	switch op {
 	case ">", ">=", "<", "<=":
-		// ensure numeric literal for range operators
-		size := len(trimmed)
-		if size <= 0 {
-			size = 1
+		if opIdx%2 == 0 {
+			// numeric range literal path
+			size := len(trimmed)
+			if size <= 0 {
+				size = 1
+			}
+			return strings.TrimSpace(strings.Repeat("1", size%5+1))
 		}
-		return strings.TrimSpace(strings.Repeat("1", size%5+1))
+		// datetime range literal path
+		dates := []string{
+			"2026-03-05",
+			"2026-03-05T10:28:21Z",
+			"2026-03-05T11:28:21+01:00",
+			"2026-03-05T11:29:41.265+01:00",
+		}
+		date := dates[int(opIdx)%len(dates)]
+		if opIdx%3 == 0 {
+			return fmt.Sprintf("\"%s\"", date)
+		}
+		return date
 	default:
 		lower := strings.ToLower(trimmed)
 		if lower == "true" || lower == "false" {

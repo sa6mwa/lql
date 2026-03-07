@@ -77,6 +77,9 @@ func simplifySelectorNode(sel Selector) (Selector, selectorTruth) {
 	if sel.Range != nil {
 		out.Range = sel.Range
 	}
+	if sel.Date != nil {
+		out.Date = sel.Date
+	}
 	if sel.In != nil {
 		out.In = sel.In
 	}

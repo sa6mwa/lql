@@ -31,6 +31,8 @@ func TestQueryStreamSelectorAllocBudgetDecisionOnlyLargeFields(t *testing.T) {
 	}{
 		{name: "eq_top_level_large_string", expr: `/message="no-match"`},
 		{name: "eq_nested_large_string", expr: `/records/0/message="no-match"`},
+		{name: "eq_top_level_temporal_date", expr: `/timestamp="2026-03-05"`},
+		{name: "eq_nested_temporal_date", expr: `/records/0/timestamp="2026-03-05"`},
 		{name: "contains_top_level_large_string", expr: `contains{field=/message,value=service}`},
 		{name: "contains_any_top_level_large_string", expr: `contains{field=/message,any=service|timeout}`},
 		{name: "icontains_nested_large_string", expr: `icontains{field=/records/0/message,value=timeout}`},
@@ -40,6 +42,10 @@ func TestQueryStreamSelectorAllocBudgetDecisionOnlyLargeFields(t *testing.T) {
 		{name: "in_top_level_large_string", expr: `in{field=/message,any=foo|bar|baz}`},
 		{name: "in_nested_large_string", expr: `in{field=/records/0/message,any=foo|bar}`},
 		{name: "range_top_level_scalar", expr: `range{field=/count,gte=40}`},
+		{name: "range_top_level_temporal", expr: `/timestamp>=2026-03-05T10:28:21Z`},
+		{name: "range_nested_temporal", expr: `/records/0/timestamp>=2026-03-05T10:28:21Z`},
+		{name: "date_top_level_temporal", expr: `date{field=/timestamp,after=2026-03-05T10:28:21Z,before=2026-03-05T10:29:59Z}`},
+		{name: "date_nested_temporal", expr: `date{field=/records/0/timestamp,after=2026-03-05T10:28:21Z,before=2026-03-05T10:29:59Z}`},
 		{name: "range_large_array_tail", expr: fmt.Sprintf("range{field=%s,gte=0}", arrayTailPath)},
 		{name: "exists_large_array", expr: `exists{/payload}`},
 		{name: "and_combo_large_fields", expr: `and.contains{field=/message,value=Timeout},and.range{field=/count,gte=40}`},
@@ -83,6 +89,7 @@ func TestQueryStreamSelectorAllocBudgetPlusValueLargeStrings(t *testing.T) {
 		expr string
 	}{
 		{name: "eq_top_level_large_string", expr: `/message="no-match"`},
+		{name: "eq_top_level_temporal_date", expr: `/timestamp="2026-03-05"`},
 		{name: "contains_top_level_large_string", expr: `contains{field=/message,value=service}`},
 		{name: "contains_any_top_level_large_string", expr: `contains{field=/message,any=service|timeout}`},
 		{name: "icontains_top_level_large_string", expr: `icontains{field=/message,value=timeout}`},
@@ -90,6 +97,8 @@ func TestQueryStreamSelectorAllocBudgetPlusValueLargeStrings(t *testing.T) {
 		{name: "iprefix_top_level_large_string", expr: `iprefix{field=/message,value=timeout}`},
 		{name: "contains_nested_large_string", expr: `contains{field=/records/0/message,value=service}`},
 		{name: "in_top_level_large_string", expr: `in{field=/message,any=foo|bar|baz}`},
+		{name: "range_top_level_temporal", expr: `/timestamp>=2026-03-05T10:28:21Z`},
+		{name: "date_top_level_temporal", expr: `date{field=/timestamp,after=2026-03-05T10:28:21Z,before=2026-03-05T10:29:59Z}`},
 	}
 
 	var src bytes.Reader
@@ -133,14 +142,19 @@ func buildSelectorAllocPayload(t *testing.T, candidateCount, messageSize, arrayE
 
 	var builder strings.Builder
 	for i := 0; i < candidateCount; i++ {
+		timestamp := fmt.Sprintf("2026-03-05T10:28:%02dZ", 21+(i%30))
 		builder.WriteString(`{"id":"`)
 		builder.WriteString(strconv.Itoa(i))
 		builder.WriteString(`","kind":"target","count":42,"message":"`)
 		builder.WriteString(message)
+		builder.WriteString(`","timestamp":"`)
+		builder.WriteString(timestamp)
 		builder.WriteString(`","payload":[`)
 		builder.WriteString(payloadArray)
 		builder.WriteString(`],"records":[{"message":"`)
 		builder.WriteString(message)
+		builder.WriteString(`","timestamp":"`)
+		builder.WriteString(timestamp)
 		builder.WriteString(`","kind":"target","count":42}]}`)
 		builder.WriteByte('\n')
 	}

@@ -356,6 +356,10 @@ func paritySelectorExpressions() []string {
 		`in{field=/voucher/lines/10/status,any=open|closed|ok|processing}`,
 		`contains{field=/voucher/lines/10/msg,value=line}`,
 		`/voucher/.../10/amount>=1`,
+		`/timestamp="2026-03-05"`,
+		`/timestamp>=2026-03-05T10:28:21Z`,
+		`range{field=/timestamp,gte=2026-03-05T10:28:21Z,lt=2026-03-05T10:30:00Z}`,
+		`date{field=/timestamp,after=2026-03-05T10:28:21Z,before=2026-03-05T10:30:00Z}`,
 		`/status="open",or.eq{field=/msg,value="Timeout while reading"},or.eq{field=/msg,value=fail}`,
 		`or.eq{field=/status,value=open},or.eq{field=/status,value=closed},not.eq{field=/region,value=apac},range{field=/latency,gte=50},in{field=/env,any=prod|stage},exists{/meta}`,
 	}
@@ -376,6 +380,13 @@ func synthesizeParityDoc(seed []byte, idx int) map[string]any {
 	envs := []string{"prod", "stage", "dev"}
 	owners := []string{"alice", "bob", "carol"}
 	skus := []string{"A", "B", "C", "D"}
+	timestamps := []string{
+		"2026-03-05T10:28:21Z",
+		"2026-03-05T11:28:21+01:00",
+		"2026-03-05T10:29:41.265Z",
+		"2026-03-05",
+		"not-a-date",
+	}
 
 	etagMode := paritySeedByte(seed, idx*11+1) % 3
 	var etag any
@@ -419,14 +430,15 @@ func synthesizeParityDoc(seed []byte, idx int) map[string]any {
 	}
 
 	return map[string]any{
-		"id":       fmt.Sprintf("doc-%d-%d", idx, paritySeedByte(seed, idx*11+5)),
-		"status":   statuses[int(paritySeedByte(seed, idx*11+6))%len(statuses)],
-		"region":   regions[int(paritySeedByte(seed, idx*11+7))%len(regions)],
-		"msg":      msgs[int(paritySeedByte(seed, idx*11+8))%len(msgs)],
-		"service":  services[int(paritySeedByte(seed, idx*11+9))%len(services)],
-		"progress": int(paritySeedByte(seed, idx*11+10) % 30),
-		"latency":  int(paritySeedByte(seed, idx*11+11)%250) + 10,
-		"env":      envs[int(paritySeedByte(seed, idx*11+12))%len(envs)],
+		"id":        fmt.Sprintf("doc-%d-%d", idx, paritySeedByte(seed, idx*11+5)),
+		"status":    statuses[int(paritySeedByte(seed, idx*11+6))%len(statuses)],
+		"region":    regions[int(paritySeedByte(seed, idx*11+7))%len(regions)],
+		"msg":       msgs[int(paritySeedByte(seed, idx*11+8))%len(msgs)],
+		"service":   services[int(paritySeedByte(seed, idx*11+9))%len(services)],
+		"progress":  int(paritySeedByte(seed, idx*11+10) % 30),
+		"latency":   int(paritySeedByte(seed, idx*11+11)%250) + 10,
+		"timestamp": timestamps[int(paritySeedByte(seed, idx*11+25))%len(timestamps)],
+		"env":       envs[int(paritySeedByte(seed, idx*11+12))%len(envs)],
 		"meta": map[string]any{
 			"etag":  etag,
 			"trace": int(paritySeedByte(seed, idx*11+13) % 8),

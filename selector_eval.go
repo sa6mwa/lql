@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Matches reports whether doc satisfies sel. A nil document never matches.
@@ -54,6 +55,9 @@ func matchSelector(sel Selector, doc map[string]any) bool {
 	if sel.Range != nil && !matchRange(sel.Range, doc) {
 		return false
 	}
+	if sel.Date != nil && !matchDate(sel.Date, doc) {
+		return false
+	}
 	if sel.In != nil && !matchIn(sel.In, doc) {
 		return false
 	}
@@ -76,12 +80,23 @@ func matchEq(term *Term, doc map[string]any) bool {
 	if !ok {
 		return false
 	}
+	queryTemporal, queryTemporalOK := termTemporalLiteralValue(term)
 	for _, value := range values {
 		current, ok := valueToString(value)
 		if !ok {
 			continue
 		}
 		if current == term.Value {
+			return true
+		}
+		if !queryTemporalOK {
+			continue
+		}
+		candidateTemporal, candidateTemporalOK := parseTemporalLiteral(current)
+		if !candidateTemporalOK {
+			continue
+		}
+		if temporalEqual(candidateTemporal, queryTemporal) {
 			return true
 		}
 	}
@@ -153,24 +168,69 @@ func matchRange(term *RangeTerm, doc map[string]any) bool {
 	if !ok {
 		return false
 	}
+	switch determineRangeMode(term) {
+	case rangeModeNumeric:
+		bounds, ok := compileNumericRangeBounds(term)
+		if !ok {
+			return false
+		}
+		for _, value := range values {
+			num, ok := valueToFloat(value)
+			if !ok {
+				continue
+			}
+			if numericRangeMatches(bounds, num) {
+				return true
+			}
+		}
+	case rangeModeTemporal:
+		bounds, ok := compileTemporalRangeBounds(term)
+		if !ok {
+			return false
+		}
+		for _, value := range values {
+			current, ok := valueToString(value)
+			if !ok {
+				continue
+			}
+			candidate, ok := parseTemporalLiteral(current)
+			if !ok {
+				continue
+			}
+			if temporalRangeMatches(bounds, candidate) {
+				return true
+			}
+		}
+	default:
+		return false
+	}
+	return false
+}
+
+func matchDate(term *DateTerm, doc map[string]any) bool {
+	if term == nil || term.Field == "" {
+		return false
+	}
+	compiled, ok := compileDateTerm(term, time.Now())
+	if !ok {
+		return false
+	}
+	values, ok := valuesAtPath(doc, term.Field)
+	if !ok {
+		return false
+	}
 	for _, value := range values {
-		num, ok := valueToFloat(value)
+		current, ok := valueToString(value)
 		if !ok {
 			continue
 		}
-		if term.GTE != nil && num < *term.GTE {
+		candidate, ok := parseTemporalLiteral(current)
+		if !ok {
 			continue
 		}
-		if term.GT != nil && num <= *term.GT {
-			continue
+		if dateTermMatches(compiled, candidate) {
+			return true
 		}
-		if term.LTE != nil && num > *term.LTE {
-			continue
-		}
-		if term.LT != nil && num >= *term.LT {
-			continue
-		}
-		return true
 	}
 	return false
 }

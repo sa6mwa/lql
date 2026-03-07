@@ -48,9 +48,12 @@ FUZZ_TARGETS ?= \
 	FuzzQueryStreamSpoolSelectorParity \
 	FuzzQueryStreamMatchedOnlyParity \
 	FuzzQueryStreamCallerSinkParity \
+	FuzzQueryStreamStopControlsParity \
+	FuzzQueryStreamCallerSinkCallbackStop \
 	FuzzMutateStreamWriterParity \
 	FuzzMutateStreamCallbackParity \
 	FuzzMutateStreamModeRobustness \
+	FuzzMutateStreamWithResultWriterParity \
 	FuzzMutateStreamProgramParity
 
 FUZZ_TARGETS_SMOKE ?= \

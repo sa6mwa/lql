@@ -244,6 +244,18 @@ func loadQueryBenchmarkDatasets() ([]queryBenchmarkDataset, error) {
 				spoolExpected: false,
 			},
 			{
+				name:          "large_ndjson_datetime_range",
+				payload:       ndjson,
+				selectorExpr:  `/timestamp>=2026-03-05T10:28:21Z`,
+				spoolExpected: false,
+			},
+			{
+				name:          "large_ndjson_date_selector",
+				payload:       ndjson,
+				selectorExpr:  `date{field=/timestamp,after=2026-03-05T10:28:21Z,before=2026-03-05T10:29:50Z}`,
+				spoolExpected: false,
+			},
+			{
 				name:          "large_array",
 				payload:       arrayJSON,
 				selectorExpr:  `/status="open"`,
@@ -339,9 +351,14 @@ func buildQuerySingleObjectPayload(count, blobSize int) ([]byte, error) {
 }
 
 func buildQueryRecordJSON(i int, status, blob string) string {
+	timestamp := "2026-03-05T11:28:21+01:00"
+	if i%2 == 1 {
+		timestamp = "2026-03-05T11:29:41.265+01:00"
+	}
 	return `{"id":"id-` + strconv.Itoa(i) +
 		`","status":"` + status +
 		`","metrics":{"retries":` + strconv.Itoa(i%9) +
 		`,"qps":` + strconv.Itoa((i%1000)+1) +
-		`},"blob":"` + blob + `"}`
+		`},"timestamp":"` + timestamp +
+		`","blob":"` + blob + `"}`
 }

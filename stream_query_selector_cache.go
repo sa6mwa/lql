@@ -101,6 +101,7 @@ func hashSelectorInto(h *uint64, selector Selector) {
 	hashTerm(h, selector.Prefix)
 	hashTerm(h, selector.IPrefix)
 	hashRangeTerm(h, selector.Range)
+	hashDateTerm(h, selector.Date)
 	hashInTerm(h, selector.In)
 	hashString(h, selector.Exists)
 }
@@ -131,10 +132,27 @@ func hashRangeTerm(h *uint64, term *RangeTerm) {
 	}
 	hashByte(h, 1)
 	hashString(h, term.Field)
-	hashFloatPtr(h, term.GTE)
-	hashFloatPtr(h, term.GT)
-	hashFloatPtr(h, term.LTE)
-	hashFloatPtr(h, term.LT)
+	hashRangeBound(h, term.GTE)
+	hashRangeBound(h, term.GT)
+	hashRangeBound(h, term.LTE)
+	hashRangeBound(h, term.LT)
+}
+
+func hashDateTerm(h *uint64, term *DateTerm) {
+	if term == nil {
+		hashByte(h, 0)
+		return
+	}
+	hashByte(h, 1)
+	hashString(h, term.Field)
+	hashString(h, term.Value)
+	hashString(h, term.Since)
+	hashString(h, term.After)
+	hashString(h, term.Before)
+	hashString(h, term.GTE)
+	hashString(h, term.GT)
+	hashString(h, term.LTE)
+	hashString(h, term.LT)
 }
 
 func hashInTerm(h *uint64, term *InTerm) {
@@ -150,13 +168,23 @@ func hashInTerm(h *uint64, term *InTerm) {
 	}
 }
 
-func hashFloatPtr(h *uint64, value *float64) {
-	if value == nil {
+func hashRangeBound(h *uint64, bound *RangeBound) {
+	if bound == nil {
 		hashByte(h, 0)
 		return
 	}
 	hashByte(h, 1)
-	hashUint64(h, math.Float64bits(*value))
+	if value, ok := bound.Number(); ok {
+		hashByte(h, 1)
+		hashUint64(h, math.Float64bits(value))
+		return
+	}
+	if value, ok := bound.DateTime(); ok {
+		hashByte(h, 2)
+		hashString(h, value)
+		return
+	}
+	hashByte(h, 3)
 }
 
 func hashString(h *uint64, value string) {
@@ -209,6 +237,7 @@ func selectorEqual(a, b Selector) bool {
 		!termEqual(a.Prefix, b.Prefix) ||
 		!termEqual(a.IPrefix, b.IPrefix) ||
 		!rangeTermEqual(a.Range, b.Range) ||
+		!dateTermEqual(a.Date, b.Date) ||
 		!inTermEqual(a.In, b.In) {
 		return false
 	}
@@ -241,10 +270,28 @@ func rangeTermEqual(a, b *RangeTerm) bool {
 		return true
 	}
 	return a.Field == b.Field &&
-		floatPtrEqual(a.GTE, b.GTE) &&
-		floatPtrEqual(a.GT, b.GT) &&
-		floatPtrEqual(a.LTE, b.LTE) &&
-		floatPtrEqual(a.LT, b.LT)
+		rangeBoundEqual(a.GTE, b.GTE) &&
+		rangeBoundEqual(a.GT, b.GT) &&
+		rangeBoundEqual(a.LTE, b.LTE) &&
+		rangeBoundEqual(a.LT, b.LT)
+}
+
+func dateTermEqual(a, b *DateTerm) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	return a.Field == b.Field &&
+		a.Value == b.Value &&
+		a.Since == b.Since &&
+		a.After == b.After &&
+		a.Before == b.Before &&
+		a.GTE == b.GTE &&
+		a.GT == b.GT &&
+		a.LTE == b.LTE &&
+		a.LT == b.LT
 }
 
 func inTermEqual(a, b *InTerm) bool {
@@ -265,14 +312,21 @@ func inTermEqual(a, b *InTerm) bool {
 	return true
 }
 
-func floatPtrEqual(a, b *float64) bool {
+func rangeBoundEqual(a, b *RangeBound) bool {
 	if (a == nil) != (b == nil) {
 		return false
 	}
 	if a == nil {
 		return true
 	}
-	return *a == *b
+	an, aok := a.Number()
+	bn, bok := b.Number()
+	if aok || bok {
+		return aok == bok && an == bn
+	}
+	ad, aok := a.DateTime()
+	bd, bok := b.DateTime()
+	return aok == bok && ad == bd
 }
 
 func cloneSelector(selector Selector) Selector {
@@ -301,6 +355,7 @@ func cloneSelector(selector Selector) Selector {
 	out.Prefix = cloneTerm(selector.Prefix)
 	out.IPrefix = cloneTerm(selector.IPrefix)
 	out.Range = cloneRangeTerm(selector.Range)
+	out.Date = cloneDateTerm(selector.Date)
 	out.In = cloneInTerm(selector.In)
 	return out
 }
@@ -322,22 +377,39 @@ func cloneRangeTerm(term *RangeTerm) *RangeTerm {
 	}
 	clone := &RangeTerm{Field: term.Field}
 	if term.GTE != nil {
-		v := *term.GTE
-		clone.GTE = &v
+		clone.GTE = cloneRangeBound(term.GTE)
 	}
 	if term.GT != nil {
-		v := *term.GT
-		clone.GT = &v
+		clone.GT = cloneRangeBound(term.GT)
 	}
 	if term.LTE != nil {
-		v := *term.LTE
-		clone.LTE = &v
+		clone.LTE = cloneRangeBound(term.LTE)
 	}
 	if term.LT != nil {
-		v := *term.LT
-		clone.LT = &v
+		clone.LT = cloneRangeBound(term.LT)
 	}
 	return clone
+}
+
+func cloneRangeBound(bound *RangeBound) *RangeBound {
+	if bound == nil {
+		return nil
+	}
+	if value, ok := bound.Number(); ok {
+		return NewNumericRangeBound(value)
+	}
+	if value, ok := bound.DateTime(); ok {
+		return NewDatetimeRangeBound(value)
+	}
+	return &RangeBound{}
+}
+
+func cloneDateTerm(term *DateTerm) *DateTerm {
+	if term == nil {
+		return nil
+	}
+	clone := *term
+	return &clone
 }
 
 func cloneInTerm(term *InTerm) *InTerm {

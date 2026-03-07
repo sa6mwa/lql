@@ -1,6 +1,9 @@
 package lql
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestMatchesWildcardSelectors(t *testing.T) {
 	doc := map[string]any{
@@ -648,6 +651,51 @@ func TestMatchesInlineAliases(t *testing.T) {
 	}
 	if Matches(sel, map[string]any{"status": "ok", "env": "dev"}) {
 		t.Fatal("expected selector to reject env")
+	}
+}
+
+func TestMatchesEqDateOnlyIntersectsTimestamp(t *testing.T) {
+	selector := mustParseSelector(t, `/something="2025-01-01"`)
+	docMatch := map[string]any{"something": "2025-01-01T15:00:00Z"}
+	docMiss := map[string]any{"something": "2025-01-02T00:00:00Z"}
+	if !Matches(selector, docMatch) {
+		t.Fatalf("expected date-only equality to match timestamp on same date")
+	}
+	if Matches(selector, docMiss) {
+		t.Fatalf("expected date-only equality to reject different date")
+	}
+}
+
+func TestMatchesRangeDatetimeAcrossTimezone(t *testing.T) {
+	selector := mustParseSelector(t, `/something>=2026-03-05T10:28:21Z`)
+	doc := map[string]any{"something": "2026-03-05T11:28:21+01:00"}
+	if !Matches(selector, doc) {
+		t.Fatalf("expected timezone-normalized datetime range match")
+	}
+}
+
+func TestMatchesDateSelectorBounds(t *testing.T) {
+	selector := mustParseSelector(t, `date{f=/something,after=2025-01-01,before=2025-01-03}`)
+	docMatch := map[string]any{"something": "2025-01-02T06:00:00Z"}
+	docMiss := map[string]any{"something": "2025-01-03T00:00:00Z"}
+	if !Matches(selector, docMatch) {
+		t.Fatalf("expected date selector bound match")
+	}
+	if Matches(selector, docMiss) {
+		t.Fatalf("expected date selector upper-bound miss")
+	}
+}
+
+func TestMatchesDateSelectorSinceNowMacro(t *testing.T) {
+	now := time.Now()
+	selector := mustParseSelector(t, `date{f=/something,since=now}`)
+	docFuture := map[string]any{"something": now.Add(2 * time.Minute).Format(time.RFC3339Nano)}
+	docPast := map[string]any{"something": now.Add(-2 * time.Minute).Format(time.RFC3339Nano)}
+	if !Matches(selector, docFuture) {
+		t.Fatalf("expected future timestamp to match since=now")
+	}
+	if Matches(selector, docPast) {
+		t.Fatalf("expected past timestamp to miss since=now")
 	}
 }
 

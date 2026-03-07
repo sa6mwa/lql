@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -18,6 +19,7 @@ import (
 )
 
 var queryStreamPayloadHint = newStreamAdaptiveHint(256, 64*1024, 8*1024*1024)
+var queryStreamNow = time.Now
 
 // QueryStreamCapturePolicy controls candidate payload capture strategy in
 // QueryDecisionPlusValue mode.
@@ -296,6 +298,16 @@ func QueryStreamWithResult(req QueryStreamRequest) (QueryStreamResult, error) {
 		state.hitsScratch = hits
 		state.engine = &state.engineStorage
 	}
+	compiledScratch, err := state.engine.prepareDateRuntimeClauses(queryStreamNow(), state.dateCompiledScratch)
+	if err != nil {
+		return state.result, &StreamError{
+			Code:   StreamErrorInvalidSelector,
+			Detail: "invalid selector",
+			Offset: -1,
+			Err:    err,
+		}
+	}
+	state.dateCompiledScratch = compiledScratch
 
 	bufReader, ok := req.Reader.(*bufio.Reader)
 	if !ok {
@@ -386,26 +398,30 @@ func releaseStreamScanState(state *streamScanState) {
 	state.numberBuf = state.numberBuf[:0]
 	state.stringTermIdxScratch = state.stringTermIdxScratch[:0]
 	state.stringInIdxScratch = state.stringInIdxScratch[:0]
+	state.stringRangeIdxScratch = state.stringRangeIdxScratch[:0]
+	state.stringDateIdxScratch = state.stringDateIdxScratch[:0]
 	state.stringExistsIDScratch = state.stringExistsIDScratch[:0]
 	state.stringTermMatchers = state.stringTermMatchers[:0]
 	state.stringInMatchers = state.stringInMatchers[:0]
 	state.stringInAliveScratch = state.stringInAliveScratch[:0]
 	state.stringLowerScratch = state.stringLowerScratch[:0]
+	state.dateCompiledScratch = state.dateCompiledScratch[:0]
 	streamScanStatePool.Put(state)
 }
 
 type streamScanState struct {
-	ctx           context.Context
-	engine        *streamSelectorEngine
-	engineStorage streamSelectorEngine
-	hitsScratch   []bool
-	includeJSON   bool
-	matchedOnly   bool
-	capturePolicy QueryStreamCapturePolicy
-	onDecision    func(QueryStreamDecision) error
-	onValue       func(QueryStreamValue) error
-	result        QueryStreamResult
-	stopRequested bool
+	ctx                 context.Context
+	engine              *streamSelectorEngine
+	engineStorage       streamSelectorEngine
+	hitsScratch         []bool
+	dateCompiledScratch []compiledDateTerm
+	includeJSON         bool
+	matchedOnly         bool
+	capturePolicy       QueryStreamCapturePolicy
+	onDecision          func(QueryStreamDecision) error
+	onValue             func(QueryStreamValue) error
+	result              QueryStreamResult
+	stopRequested       bool
 
 	payloadSinkMaker   QueryStreamPayloadSinkFactory
 	disableSpool       bool
@@ -435,6 +451,8 @@ type streamScanState struct {
 
 	stringTermIdxScratch  []int
 	stringInIdxScratch    []int
+	stringRangeIdxScratch []int
+	stringDateIdxScratch  []int
 	stringExistsIDScratch []int
 	stringTermMatchers    []streamStringTermMatcher
 	stringInMatchers      []streamStringInMatcher
@@ -478,11 +496,14 @@ func (s *streamScanState) reset(ctx context.Context, includeJSON bool, req Query
 	s.numberBuf = s.numberBuf[:0]
 	s.stringTermIdxScratch = s.stringTermIdxScratch[:0]
 	s.stringInIdxScratch = s.stringInIdxScratch[:0]
+	s.stringRangeIdxScratch = s.stringRangeIdxScratch[:0]
+	s.stringDateIdxScratch = s.stringDateIdxScratch[:0]
 	s.stringExistsIDScratch = s.stringExistsIDScratch[:0]
 	s.stringTermMatchers = s.stringTermMatchers[:0]
 	s.stringInMatchers = s.stringInMatchers[:0]
 	s.stringInAliveScratch = s.stringInAliveScratch[:0]
 	s.stringLowerScratch = s.stringLowerScratch[:0]
+	s.dateCompiledScratch = s.dateCompiledScratch[:0]
 	s.lastValue = queryStreamPayloadHint.Load()
 }
 
@@ -981,18 +1002,22 @@ func (s *streamScanState) scanValue(reader *streamByteReader, start byte) (strea
 			s.observeMatchSignal(streamValueString, nil)
 			return streamValueString, nil
 		}
-		termIdxs, inIdxs, existsIDs := s.engine.collectStringPathClauseSets(
+		termIdxs, inIdxs, rangeIdxs, dateIdxs, existsIDs := s.engine.collectStringPathClauseSets(
 			s.path,
 			s.keyBytes,
 			s.stringTermIdxScratch,
 			s.stringInIdxScratch,
+			s.stringRangeIdxScratch,
+			s.stringDateIdxScratch,
 			s.stringExistsIDScratch,
 		)
 		s.stringTermIdxScratch = termIdxs
 		s.stringInIdxScratch = inIdxs
+		s.stringRangeIdxScratch = rangeIdxs
+		s.stringDateIdxScratch = dateIdxs
 		s.stringExistsIDScratch = existsIDs
-		if len(termIdxs) > 0 || len(inIdxs) > 0 {
-			if err := s.streamMatchStringClauses(reader, termIdxs, inIdxs, s.includeJSON); err != nil {
+		if len(termIdxs) > 0 || len(inIdxs) > 0 || len(rangeIdxs) > 0 || len(dateIdxs) > 0 {
+			if err := s.streamMatchStringClauses(reader, termIdxs, inIdxs, rangeIdxs, dateIdxs, s.includeJSON); err != nil {
 				return streamValueInvalid, err
 			}
 			for _, id := range existsIDs {
@@ -1296,7 +1321,7 @@ func (s *streamScanState) fastTopLevelEqValueMatches(reader *streamByteReader, s
 			termIdxs := s.stringTermIdxScratch[:0]
 			termIdxs = append(termIdxs, clause.termIdx)
 			s.stringTermIdxScratch = termIdxs
-			if err := s.streamMatchStringClauses(reader, termIdxs, nil, s.includeJSON); err != nil {
+			if err := s.streamMatchStringClauses(reader, termIdxs, nil, nil, nil, s.includeJSON); err != nil {
 				return false, err
 			}
 			return s.engine.hits[clause.id], nil
@@ -1374,6 +1399,11 @@ func (s *streamScanState) fastTopLevelFieldHasPending(field *streamFastTopLevelF
 			return true
 		}
 	}
+	for _, idx := range field.dateIdxs {
+		if !s.engine.hits[s.engine.dateClauses[idx].id] {
+			return true
+		}
+	}
 	for _, idx := range field.inIdxs {
 		if !s.engine.hits[s.engine.inClauses[idx].id] {
 			return true
@@ -1443,10 +1473,28 @@ func (s *streamScanState) fastTopLevelObserveValue(reader *streamByteReader, sta
 			}
 			inIdxs = append(inIdxs, idx)
 		}
+		rangeIdxs := s.stringRangeIdxScratch[:0]
+		for _, idx := range field.rangeIdxs {
+			clause := &s.engine.rangeClauses[idx]
+			if s.engine.hits[clause.id] {
+				continue
+			}
+			rangeIdxs = append(rangeIdxs, idx)
+		}
+		dateIdxs := s.stringDateIdxScratch[:0]
+		for _, idx := range field.dateIdxs {
+			clause := &s.engine.dateClauses[idx]
+			if s.engine.hits[clause.id] {
+				continue
+			}
+			dateIdxs = append(dateIdxs, idx)
+		}
 		s.stringTermIdxScratch = termIdxs
 		s.stringInIdxScratch = inIdxs
-		if len(termIdxs) > 0 || len(inIdxs) > 0 {
-			if err := s.streamMatchStringClauses(reader, termIdxs, inIdxs, s.includeJSON); err != nil {
+		s.stringRangeIdxScratch = rangeIdxs
+		s.stringDateIdxScratch = dateIdxs
+		if len(termIdxs) > 0 || len(inIdxs) > 0 || len(rangeIdxs) > 0 || len(dateIdxs) > 0 {
+			if err := s.streamMatchStringClauses(reader, termIdxs, inIdxs, rangeIdxs, dateIdxs, s.includeJSON); err != nil {
 				return err
 			}
 		} else if s.includeJSON {
@@ -1595,7 +1643,17 @@ func streamTermClauseMatchesString(clause *streamTermClause, candidate string) b
 	}
 	switch clause.mode {
 	case streamTermEq:
-		return candidate == clause.needle
+		if candidate == clause.needle {
+			return true
+		}
+		if !clause.hasTemporalEq {
+			return false
+		}
+		value, ok := parseTemporalLiteral(candidate)
+		if !ok {
+			return false
+		}
+		return temporalEqual(value, clause.temporalEq)
 	case streamTermContains:
 		if clause.containsAC != nil {
 			state := 0
@@ -1633,20 +1691,10 @@ func (s *streamScanState) fastTopLevelMatchRange(field *streamFastTopLevelField,
 		if s.engine.hits[clause.id] {
 			continue
 		}
-		term := clause.term
-		if term.GTE != nil && number < *term.GTE {
+		if clause.mode != rangeModeNumeric {
 			continue
 		}
-		if term.GT != nil && number <= *term.GT {
-			continue
-		}
-		if term.LTE != nil && number > *term.LTE {
-			continue
-		}
-		if term.LT != nil && number >= *term.LT {
-			continue
-		}
-		s.engine.hits[clause.id] = true
+		s.engine.hits[clause.id] = numericRangeMatches(clause.numericBounds, number)
 	}
 }
 
@@ -1949,12 +1997,30 @@ func (s *streamScanState) payloadWriteByte(value byte) error {
 	return err
 }
 
-func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, termIdxs []int, inIdxs []int, writeJSON bool) error {
-	if len(termIdxs) == 1 && len(inIdxs) == 0 {
-		clause := &s.engine.termClauses[termIdxs[0]]
-		return s.streamMatchSingleTermClause(reader, clause, writeJSON)
+func (s *streamScanState) streamMatchStringClauses(
+	reader *streamByteReader,
+	termIdxs []int,
+	inIdxs []int,
+	rangeIdxs []int,
+	dateIdxs []int,
+	writeJSON bool,
+) error {
+	captureDecoded := len(rangeIdxs) > 0 || len(dateIdxs) > 0
+	if !captureDecoded {
+		for _, idx := range termIdxs {
+			if s.engine.termClauses[idx].hasTemporalEq {
+				captureDecoded = true
+				break
+			}
+		}
 	}
-	if len(termIdxs) == 0 && len(inIdxs) == 1 {
+	if len(termIdxs) == 1 && len(inIdxs) == 0 && len(rangeIdxs) == 0 && len(dateIdxs) == 0 {
+		clause := &s.engine.termClauses[termIdxs[0]]
+		if !clause.hasTemporalEq {
+			return s.streamMatchSingleTermClause(reader, clause, writeJSON)
+		}
+	}
+	if len(termIdxs) == 0 && len(inIdxs) == 1 && len(rangeIdxs) == 0 && len(dateIdxs) == 0 {
 		clause := &s.engine.inClauses[inIdxs[0]]
 		return s.streamMatchSingleInClause(reader, clause, writeJSON)
 	}
@@ -2014,6 +2080,9 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 			activeCount: len(alive),
 		})
 	}
+	if captureDecoded {
+		s.stringBuf = s.stringBuf[:0]
+	}
 
 	if writeJSON {
 		if err := s.payloadWriteByte('"'); err != nil {
@@ -2034,6 +2103,9 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 					if err := s.payloadWriteBytes(segment); err != nil {
 						return err
 					}
+				}
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, segment...)
 				}
 				for _, b := range segment {
 					s.streamMatchFeedASCIIByte(b)
@@ -2068,6 +2140,9 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 					s.engine.hits[matcher.clause.id] = true
 				}
 			}
+			if captureDecoded {
+				s.applyTemporalStringClauseMatches(bytesToStringUnsafe(s.stringBuf), termIdxs, rangeIdxs, dateIdxs)
+			}
 			return nil
 		case '\\':
 			if writeJSON {
@@ -2086,21 +2161,42 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 			}
 			switch escaped {
 			case '"', '\\', '/':
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, escaped)
+				}
 				s.streamMatchFeedASCIIByte(escaped)
 			case 'b':
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, '\b')
+				}
 				s.streamMatchFeedASCIIByte('\b')
 			case 'f':
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, '\f')
+				}
 				s.streamMatchFeedASCIIByte('\f')
 			case 'n':
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, '\n')
+				}
 				s.streamMatchFeedASCIIByte('\n')
 			case 'r':
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, '\r')
+				}
 				s.streamMatchFeedASCIIByte('\r')
 			case 't':
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, '\t')
+				}
 				s.streamMatchFeedASCIIByte('\t')
 			case 'u':
 				r, err := s.readUnicodeEscapeCopy(reader, writeJSON)
 				if err != nil {
 					return err
+				}
+				if captureDecoded {
+					s.stringBuf = utf8.AppendRune(s.stringBuf, r)
 				}
 				s.streamMatchFeedRune(r)
 			default:
@@ -2116,6 +2212,9 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 				}
 			}
 			if ch < utf8.RuneSelf {
+				if captureDecoded {
+					s.stringBuf = append(s.stringBuf, ch)
+				}
 				s.streamMatchFeedASCIIByte(ch)
 				continue
 			}
@@ -2140,8 +2239,58 @@ func (s *streamScanState) streamMatchStringClauses(reader *streamByteReader, ter
 			if _, err := reader.Discard(size - 1); err != nil {
 				return err
 			}
+			if captureDecoded {
+				s.stringBuf = utf8.AppendRune(s.stringBuf, r)
+			}
 			s.streamMatchFeedRune(r)
 		}
+	}
+}
+
+func (s *streamScanState) applyTemporalStringClauseMatches(candidate string, termIdxs []int, rangeIdxs []int, dateIdxs []int) {
+	temporalReady := false
+	temporalOK := false
+	var temporalCandidate temporalValue
+	loadTemporal := func() (temporalValue, bool) {
+		if !temporalReady {
+			temporalCandidate, temporalOK = parseTemporalLiteral(candidate)
+			temporalReady = true
+		}
+		return temporalCandidate, temporalOK
+	}
+
+	for _, idx := range termIdxs {
+		clause := &s.engine.termClauses[idx]
+		if s.engine.hits[clause.id] || !clause.hasTemporalEq {
+			continue
+		}
+		value, ok := loadTemporal()
+		if !ok {
+			continue
+		}
+		s.engine.hits[clause.id] = temporalEqual(value, clause.temporalEq)
+	}
+	for _, idx := range rangeIdxs {
+		clause := &s.engine.rangeClauses[idx]
+		if s.engine.hits[clause.id] || clause.mode != rangeModeTemporal {
+			continue
+		}
+		value, ok := loadTemporal()
+		if !ok {
+			continue
+		}
+		s.engine.hits[clause.id] = temporalRangeMatches(clause.temporalBounds, value)
+	}
+	for _, idx := range dateIdxs {
+		clause := &s.engine.dateClauses[idx]
+		if s.engine.hits[clause.id] {
+			continue
+		}
+		value, ok := loadTemporal()
+		if !ok {
+			continue
+		}
+		s.engine.hits[clause.id] = dateTermMatches(s.engine.dateClauseCompiled(idx), value)
 	}
 }
 
@@ -3931,22 +4080,28 @@ type streamSelectorEngine struct {
 
 	termClauses   []streamTermClause
 	rangeClauses  []streamRangeClause
+	dateClauses   []streamDateClause
+	dateCompiled  []compiledDateTerm
 	inClauses     []streamInClause
 	existsClauses []streamExistsClause
 
 	termDispatch   streamClauseDispatchIndex
 	rangeDispatch  streamClauseDispatchIndex
+	dateDispatch   streamClauseDispatchIndex
 	inDispatch     streamClauseDispatchIndex
 	existsDispatch streamClauseDispatchIndex
 
 	termIDs   map[*Term]int
 	rangeIDs  map[*RangeTerm]int
+	dateIDs   map[*DateTerm]int
 	inIDs     map[*InTerm]int
 	existsIDs map[string]int
 
 	hasTermClauses           bool
 	hasExistsLikeTermClauses bool
 	hasRangeClauses          bool
+	hasDateClauses           bool
+	hasDynamicDateClauses    bool
 	hasInClauses             bool
 	hasExistsClauses         bool
 	useDispatch              bool
@@ -3998,6 +4153,7 @@ type streamFastTopLevelProgram struct {
 type streamFastTopLevelField struct {
 	termIdxs   []int
 	rangeIdxs  []int
+	dateIdxs   []int
 	inIdxs     []int
 	existsIdxs []int
 }
@@ -4045,6 +4201,8 @@ type streamTermClause struct {
 	containsAC      *streamContainsAutomaton
 	ignoreCase      bool
 	existsOnly      bool
+	hasTemporalEq   bool
+	temporalEq      temporalValue
 }
 
 type streamContainsAutomaton struct {
@@ -4063,6 +4221,24 @@ type streamRangeClause struct {
 	tailKeyBytes    []byte
 	tailIndex       int
 	term            *RangeTerm
+	mode            rangeMode
+	numericBounds   compiledNumericRange
+	temporalBounds  compiledTemporalRange
+}
+
+type streamDateClause struct {
+	id              int
+	path            []streamPathToken
+	hasRecursive    bool
+	singleRecursive bool
+	recursiveIdx    int
+	tailKind        streamTailFilterKind
+	tailKey         string
+	tailKeyBytes    []byte
+	tailIndex       int
+	term            *DateTerm
+	dynamicSinceNow bool
+	compiled        compiledDateTerm
 }
 
 type streamInClause struct {
@@ -4200,6 +4376,7 @@ func newStreamSelectorEngine(selector Selector) (*streamSelectorEngine, error) {
 		emptySelector: selector.IsEmpty(),
 		termIDs:       make(map[*Term]int),
 		rangeIDs:      make(map[*RangeTerm]int),
+		dateIDs:       make(map[*DateTerm]int),
 		inIDs:         make(map[*InTerm]int),
 		existsIDs:     make(map[string]int),
 	}
@@ -4249,6 +4426,11 @@ func (e *streamSelectorEngine) buildSelectorProgram(selector Selector) *streamSe
 			program.requiredIDs = append(program.requiredIDs, id)
 		}
 	}
+	if selector.Date != nil {
+		if id, ok := e.dateIDs[selector.Date]; ok {
+			program.requiredIDs = append(program.requiredIDs, id)
+		}
+	}
 	if selector.In != nil {
 		if id, ok := e.inIDs[selector.In]; ok {
 			program.requiredIDs = append(program.requiredIDs, id)
@@ -4278,7 +4460,7 @@ func (e *streamSelectorEngine) buildSelectorProgram(selector Selector) *streamSe
 }
 
 func (e *streamSelectorEngine) shouldUseDispatch() bool {
-	total := len(e.termClauses) + len(e.rangeClauses) + len(e.inClauses) + len(e.existsClauses)
+	total := len(e.termClauses) + len(e.rangeClauses) + len(e.dateClauses) + len(e.inClauses) + len(e.existsClauses)
 	return total > 4
 }
 
@@ -4309,6 +4491,12 @@ func (e *streamSelectorEngine) buildFastEqPath() {
 		}
 	}
 	if len(path) == 0 || termIdx < 0 {
+		e.fastEq = nil
+		e.fastRecursiveEq = nil
+		e.fastTopLevelEq = nil
+		return
+	}
+	if e.termClauses[termIdx].hasTemporalEq {
 		e.fastEq = nil
 		e.fastRecursiveEq = nil
 		e.fastTopLevelEq = nil
@@ -4354,7 +4542,7 @@ func (e *streamSelectorEngine) buildFastEqPath() {
 }
 
 func (e *streamSelectorEngine) buildFastTopLevelProgram() {
-	total := len(e.termClauses) + len(e.rangeClauses) + len(e.inClauses) + len(e.existsClauses)
+	total := len(e.termClauses) + len(e.rangeClauses) + len(e.dateClauses) + len(e.inClauses) + len(e.existsClauses)
 	if total == 0 {
 		e.fastTopLevel = nil
 		return
@@ -4381,6 +4569,15 @@ func (e *streamSelectorEngine) buildFastTopLevelProgram() {
 		}
 		field := program.ensureField(key)
 		field.rangeIdxs = append(field.rangeIdxs, i)
+	}
+	for i := range e.dateClauses {
+		key, ok := streamTopLevelLiteralPath(e.dateClauses[i].path)
+		if !ok {
+			e.fastTopLevel = nil
+			return
+		}
+		field := program.ensureField(key)
+		field.dateIdxs = append(field.dateIdxs, i)
 	}
 	for i := range e.inClauses {
 		key, ok := streamTopLevelLiteralPath(e.inClauses[i].path)
@@ -4422,7 +4619,7 @@ func selectorSimpleSingleEq(selector Selector) (*Term, bool) {
 	if selector.Contains != nil || selector.IContains != nil || selector.Prefix != nil || selector.IPrefix != nil {
 		return nil, false
 	}
-	if selector.Range != nil || selector.In != nil || selector.Exists != "" {
+	if selector.Range != nil || selector.Date != nil || selector.In != nil || selector.Exists != "" {
 		return nil, false
 	}
 	if selector.Not != nil || len(selector.And) > 0 || len(selector.Or) > 0 {
@@ -4469,6 +4666,11 @@ func (e *streamSelectorEngine) collect(selector Selector) error {
 	}
 	if selector.Range != nil {
 		if err := e.addRangeClause(selector.Range); err != nil {
+			return err
+		}
+	}
+	if selector.Date != nil {
+		if err := e.addDateClause(selector.Date); err != nil {
 			return err
 		}
 	}
@@ -4551,6 +4753,13 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 	if mode == streamTermContains && containsAC == nil && len(needleBytes) > 0 {
 		containsLPS = buildKMPPrefixTable(needleBytes)
 	}
+	var (
+		hasTemporalEq bool
+		temporalEq    temporalValue
+	)
+	if mode == streamTermEq {
+		temporalEq, hasTemporalEq = termTemporalLiteralValue(term)
+	}
 	e.termClauses = append(e.termClauses, streamTermClause{
 		id:              id,
 		path:            tokens,
@@ -4568,6 +4777,8 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 		containsAC:      containsAC,
 		ignoreCase:      ignoreCase,
 		existsOnly:      existsOnly,
+		hasTemporalEq:   hasTemporalEq,
+		temporalEq:      temporalEq,
 	})
 	e.termDispatch.add(tailKind, tailKey, tailIndex, len(e.termClauses)-1)
 	e.hasTermClauses = true
@@ -4580,6 +4791,22 @@ func (e *streamSelectorEngine) addTermClause(term *Term, mode streamTermMode, fo
 func (e *streamSelectorEngine) addRangeClause(term *RangeTerm) error {
 	if _, exists := e.rangeIDs[term]; exists {
 		return nil
+	}
+	mode := determineRangeMode(term)
+	if mode == rangeModeInvalid {
+		return fmt.Errorf("invalid range selector")
+	}
+	numericBounds, numericOK := compileNumericRangeBounds(term)
+	temporalBounds, temporalOK := compileTemporalRangeBounds(term)
+	switch mode {
+	case rangeModeNumeric:
+		if !numericOK {
+			return fmt.Errorf("invalid numeric range selector")
+		}
+	case rangeModeTemporal:
+		if !temporalOK {
+			return fmt.Errorf("invalid datetime range selector")
+		}
 	}
 	tokens, err := compileStreamPath(term.Field)
 	if err != nil {
@@ -4601,9 +4828,52 @@ func (e *streamSelectorEngine) addRangeClause(term *RangeTerm) error {
 		tailKeyBytes:    []byte(tailKey),
 		tailIndex:       tailIndex,
 		term:            term,
+		mode:            mode,
+		numericBounds:   numericBounds,
+		temporalBounds:  temporalBounds,
 	})
 	e.rangeDispatch.add(tailKind, tailKey, tailIndex, len(e.rangeClauses)-1)
 	e.hasRangeClauses = true
+	return nil
+}
+
+func (e *streamSelectorEngine) addDateClause(term *DateTerm) error {
+	if _, exists := e.dateIDs[term]; exists {
+		return nil
+	}
+	compiled, ok := compileDateTerm(term, queryStreamNow())
+	if !ok {
+		return fmt.Errorf("invalid date selector")
+	}
+	tokens, err := compileStreamPath(term.Field)
+	if err != nil {
+		return err
+	}
+	id := len(e.hits)
+	e.hits = append(e.hits, false)
+	e.dateIDs[term] = id
+	dynamicSinceNow := dateTermUsesRelativeSinceMacro(term)
+	if dynamicSinceNow {
+		e.hasDynamicDateClauses = true
+	}
+	hasRecursive, singleRecursive, recursiveIdx := streamPatternRecursiveInfo(tokens)
+	tailKind, tailKey, tailIndex := streamPatternTailFilter(tokens)
+	e.dateClauses = append(e.dateClauses, streamDateClause{
+		id:              id,
+		path:            tokens,
+		hasRecursive:    hasRecursive,
+		singleRecursive: singleRecursive,
+		recursiveIdx:    recursiveIdx,
+		tailKind:        tailKind,
+		tailKey:         tailKey,
+		tailKeyBytes:    []byte(tailKey),
+		tailIndex:       tailIndex,
+		term:            term,
+		dynamicSinceNow: dynamicSinceNow,
+		compiled:        compiled,
+	})
+	e.dateDispatch.add(tailKind, tailKey, tailIndex, len(e.dateClauses)-1)
+	e.hasDateClauses = true
 	return nil
 }
 
@@ -4682,6 +4952,43 @@ func (e *streamSelectorEngine) reset() {
 	}
 }
 
+func (e *streamSelectorEngine) prepareDateRuntimeClauses(now time.Time, scratch []compiledDateTerm) ([]compiledDateTerm, error) {
+	if e == nil {
+		return scratch[:0], nil
+	}
+	e.dateCompiled = nil
+	if !e.hasDynamicDateClauses || len(e.dateClauses) == 0 {
+		return scratch[:0], nil
+	}
+	count := len(e.dateClauses)
+	if cap(scratch) < count {
+		scratch = make([]compiledDateTerm, count)
+	} else {
+		scratch = scratch[:count]
+	}
+	for i := range e.dateClauses {
+		clause := &e.dateClauses[i]
+		compiled := clause.compiled
+		if clause.dynamicSinceNow {
+			var ok bool
+			compiled, ok = compileDateTerm(clause.term, now)
+			if !ok {
+				return scratch[:0], fmt.Errorf("invalid date selector")
+			}
+		}
+		scratch[i] = compiled
+	}
+	e.dateCompiled = scratch
+	return scratch, nil
+}
+
+func (e *streamSelectorEngine) dateClauseCompiled(idx int) compiledDateTerm {
+	if len(e.dateCompiled) == len(e.dateClauses) {
+		return e.dateCompiled[idx]
+	}
+	return e.dateClauses[idx].compiled
+}
+
 func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte, kind streamValueKind, value any) {
 	if e.emptySelector {
 		return
@@ -4735,24 +5042,27 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 			return
 		}
 	case streamValueNumber:
-		if !e.hasTermClauses && !e.hasInClauses && !e.hasRangeClauses && !e.hasExistsClauses {
+		if !e.hasTermClauses && !e.hasInClauses && !e.hasRangeClauses && !e.hasDateClauses && !e.hasExistsClauses {
 			return
 		}
 	case streamValueString:
-		if !e.hasTermClauses && !e.hasInClauses && !e.hasRangeClauses && !e.hasExistsClauses {
+		if !e.hasTermClauses && !e.hasInClauses && !e.hasRangeClauses && !e.hasDateClauses && !e.hasExistsClauses {
 			return
 		}
 	}
 
 	var (
-		stringCached      string
-		stringCachedOK    bool
-		stringCacheReady  bool
-		lowerStringCached string
-		lowerCacheReady   bool
-		floatCached       float64
-		floatCachedOK     bool
-		floatCacheReady   bool
+		stringCached       string
+		stringCachedOK     bool
+		stringCacheReady   bool
+		lowerStringCached  string
+		lowerCacheReady    bool
+		floatCached        float64
+		floatCachedOK      bool
+		floatCacheReady    bool
+		temporalCached     temporalValue
+		temporalCachedOK   bool
+		temporalCacheReady bool
 	)
 
 	if e.useDispatch {
@@ -4816,56 +5126,110 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 			if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				continue
 			}
-			if !floatCacheReady {
-				floatCached, floatCachedOK = valueToFloat(value)
-				floatCacheReady = true
+			switch clause.mode {
+			case rangeModeNumeric:
+				if !floatCacheReady {
+					floatCached, floatCachedOK = valueToFloat(value)
+					floatCacheReady = true
+				}
+				if !floatCachedOK {
+					continue
+				}
+				e.hits[clause.id] = numericRangeMatches(clause.numericBounds, floatCached)
+			case rangeModeTemporal:
+				if !stringCacheReady {
+					stringCached, stringCachedOK = valueToString(value)
+					stringCacheReady = true
+				}
+				if !stringCachedOK {
+					continue
+				}
+				if !temporalCacheReady {
+					temporalCached, temporalCachedOK = parseTemporalLiteral(stringCached)
+					temporalCacheReady = true
+				}
+				if !temporalCachedOK {
+					continue
+				}
+				e.hits[clause.id] = temporalRangeMatches(clause.temporalBounds, temporalCached)
 			}
-			if !floatCachedOK {
-				continue
-			}
-			number := floatCached
-			term := clause.term
-			if term.GTE != nil && number < *term.GTE {
-				continue
-			}
-			if term.GT != nil && number <= *term.GT {
-				continue
-			}
-			if term.LTE != nil && number > *term.LTE {
-				continue
-			}
-			if term.LT != nil && number >= *term.LT {
-				continue
-			}
-			e.hits[clause.id] = true
 		}
 		for _, clauseIdx := range rangeAny {
 			clause := &e.rangeClauses[clauseIdx]
 			if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				continue
 			}
-			if !floatCacheReady {
-				floatCached, floatCachedOK = valueToFloat(value)
-				floatCacheReady = true
+			switch clause.mode {
+			case rangeModeNumeric:
+				if !floatCacheReady {
+					floatCached, floatCachedOK = valueToFloat(value)
+					floatCacheReady = true
+				}
+				if !floatCachedOK {
+					continue
+				}
+				e.hits[clause.id] = numericRangeMatches(clause.numericBounds, floatCached)
+			case rangeModeTemporal:
+				if !stringCacheReady {
+					stringCached, stringCachedOK = valueToString(value)
+					stringCacheReady = true
+				}
+				if !stringCachedOK {
+					continue
+				}
+				if !temporalCacheReady {
+					temporalCached, temporalCachedOK = parseTemporalLiteral(stringCached)
+					temporalCacheReady = true
+				}
+				if !temporalCachedOK {
+					continue
+				}
+				e.hits[clause.id] = temporalRangeMatches(clause.temporalBounds, temporalCached)
 			}
-			if !floatCachedOK {
+		}
+
+		dateSpecific, dateAny := e.dateDispatch.candidates(path, keyBytes)
+		for _, clauseIdx := range dateSpecific {
+			clause := &e.dateClauses[clauseIdx]
+			if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				continue
 			}
-			number := floatCached
-			term := clause.term
-			if term.GTE != nil && number < *term.GTE {
+			if !stringCacheReady {
+				stringCached, stringCachedOK = valueToString(value)
+				stringCacheReady = true
+			}
+			if !stringCachedOK {
 				continue
 			}
-			if term.GT != nil && number <= *term.GT {
+			if !temporalCacheReady {
+				temporalCached, temporalCachedOK = parseTemporalLiteral(stringCached)
+				temporalCacheReady = true
+			}
+			if !temporalCachedOK {
 				continue
 			}
-			if term.LTE != nil && number > *term.LTE {
+			e.hits[clause.id] = dateTermMatches(e.dateClauseCompiled(clauseIdx), temporalCached)
+		}
+		for _, clauseIdx := range dateAny {
+			clause := &e.dateClauses[clauseIdx]
+			if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				continue
 			}
-			if term.LT != nil && number >= *term.LT {
+			if !stringCacheReady {
+				stringCached, stringCachedOK = valueToString(value)
+				stringCacheReady = true
+			}
+			if !stringCachedOK {
 				continue
 			}
-			e.hits[clause.id] = true
+			if !temporalCacheReady {
+				temporalCached, temporalCachedOK = parseTemporalLiteral(stringCached)
+				temporalCacheReady = true
+			}
+			if !temporalCachedOK {
+				continue
+			}
+			e.hits[clause.id] = dateTermMatches(e.dateClauseCompiled(clauseIdx), temporalCached)
 		}
 
 		inSpecific, inAny := e.inDispatch.candidates(path, keyBytes)
@@ -4954,28 +5318,56 @@ func (e *streamSelectorEngine) observe(path []streamPathSegment, keyBytes []byte
 			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 			continue
 		}
-		if !floatCacheReady {
-			floatCached, floatCachedOK = valueToFloat(value)
-			floatCacheReady = true
+		switch clause.mode {
+		case rangeModeNumeric:
+			if !floatCacheReady {
+				floatCached, floatCachedOK = valueToFloat(value)
+				floatCacheReady = true
+			}
+			if !floatCachedOK {
+				continue
+			}
+			e.hits[clause.id] = numericRangeMatches(clause.numericBounds, floatCached)
+		case rangeModeTemporal:
+			if !stringCacheReady {
+				stringCached, stringCachedOK = valueToString(value)
+				stringCacheReady = true
+			}
+			if !stringCachedOK {
+				continue
+			}
+			if !temporalCacheReady {
+				temporalCached, temporalCachedOK = parseTemporalLiteral(stringCached)
+				temporalCacheReady = true
+			}
+			if !temporalCachedOK {
+				continue
+			}
+			e.hits[clause.id] = temporalRangeMatches(clause.temporalBounds, temporalCached)
 		}
-		if !floatCachedOK {
+	}
+
+	for i := range e.dateClauses {
+		clause := &e.dateClauses[i]
+		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
+			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 			continue
 		}
-		number := floatCached
-		term := clause.term
-		if term.GTE != nil && number < *term.GTE {
+		if !stringCacheReady {
+			stringCached, stringCachedOK = valueToString(value)
+			stringCacheReady = true
+		}
+		if !stringCachedOK {
 			continue
 		}
-		if term.GT != nil && number <= *term.GT {
+		if !temporalCacheReady {
+			temporalCached, temporalCachedOK = parseTemporalLiteral(stringCached)
+			temporalCacheReady = true
+		}
+		if !temporalCachedOK {
 			continue
 		}
-		if term.LTE != nil && number > *term.LTE {
-			continue
-		}
-		if term.LT != nil && number >= *term.LT {
-			continue
-		}
-		e.hits[clause.id] = true
+		e.hits[clause.id] = dateTermMatches(e.dateClauseCompiled(i), temporalCached)
 	}
 
 	for i := range e.inClauses {
@@ -5011,13 +5403,17 @@ func (e *streamSelectorEngine) collectStringPathClauseSets(
 	keyBytes []byte,
 	termDst []int,
 	inDst []int,
+	rangeDst []int,
+	dateDst []int,
 	existsIDDst []int,
-) ([]int, []int, []int) {
+) ([]int, []int, []int, []int, []int) {
 	termDst = termDst[:0]
 	inDst = inDst[:0]
+	rangeDst = rangeDst[:0]
+	dateDst = dateDst[:0]
 	existsIDDst = existsIDDst[:0]
 	if e == nil || e.emptySelector {
-		return termDst, inDst, existsIDDst
+		return termDst, inDst, rangeDst, dateDst, existsIDDst
 	}
 	if e.useDispatch {
 		termSpecific, termAny := e.termDispatch.candidates(path, keyBytes)
@@ -5028,10 +5424,18 @@ func (e *streamSelectorEngine) collectStringPathClauseSets(
 		inDst = e.appendMatchingInClauseIndexes(path, keyBytes, inSpecific, inDst)
 		inDst = e.appendMatchingInClauseIndexes(path, keyBytes, inAny, inDst)
 
+		rangeSpecific, rangeAny := e.rangeDispatch.candidates(path, keyBytes)
+		rangeDst = e.appendMatchingTemporalRangeClauseIndexes(path, keyBytes, rangeSpecific, rangeDst)
+		rangeDst = e.appendMatchingTemporalRangeClauseIndexes(path, keyBytes, rangeAny, rangeDst)
+
+		dateSpecific, dateAny := e.dateDispatch.candidates(path, keyBytes)
+		dateDst = e.appendMatchingDateClauseIndexes(path, keyBytes, dateSpecific, dateDst)
+		dateDst = e.appendMatchingDateClauseIndexes(path, keyBytes, dateAny, dateDst)
+
 		existsSpecific, existsAny := e.existsDispatch.candidates(path, keyBytes)
 		existsIDDst = e.appendMatchingExistsClauseIDs(path, keyBytes, existsSpecific, existsIDDst)
 		existsIDDst = e.appendMatchingExistsClauseIDs(path, keyBytes, existsAny, existsIDDst)
-		return termDst, inDst, existsIDDst
+		return termDst, inDst, rangeDst, dateDst, existsIDDst
 	}
 
 	for i := range e.termClauses {
@@ -5050,6 +5454,25 @@ func (e *streamSelectorEngine) collectStringPathClauseSets(
 		}
 		inDst = append(inDst, i)
 	}
+	for i := range e.rangeClauses {
+		clause := &e.rangeClauses[i]
+		if clause.mode != rangeModeTemporal {
+			continue
+		}
+		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
+			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		rangeDst = append(rangeDst, i)
+	}
+	for i := range e.dateClauses {
+		clause := &e.dateClauses[i]
+		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
+			!streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		dateDst = append(dateDst, i)
+	}
 	for i := range e.existsClauses {
 		clause := &e.existsClauses[i]
 		if e.hits[clause.id] || !streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) ||
@@ -5058,7 +5481,7 @@ func (e *streamSelectorEngine) collectStringPathClauseSets(
 		}
 		existsIDDst = append(existsIDDst, clause.id)
 	}
-	return termDst, inDst, existsIDDst
+	return termDst, inDst, rangeDst, dateDst, existsIDDst
 }
 
 func (e *streamSelectorEngine) appendMatchingTermClauseIndexes(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
@@ -5075,6 +5498,31 @@ func (e *streamSelectorEngine) appendMatchingTermClauseIndexes(path []streamPath
 func (e *streamSelectorEngine) appendMatchingInClauseIndexes(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
 	for _, clauseIdx := range clauseIdxs {
 		clause := &e.inClauses[clauseIdx]
+		if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		dst = append(dst, clauseIdx)
+	}
+	return dst
+}
+
+func (e *streamSelectorEngine) appendMatchingTemporalRangeClauseIndexes(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
+	for _, clauseIdx := range clauseIdxs {
+		clause := &e.rangeClauses[clauseIdx]
+		if clause.mode != rangeModeTemporal {
+			continue
+		}
+		if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			continue
+		}
+		dst = append(dst, clauseIdx)
+	}
+	return dst
+}
+
+func (e *streamSelectorEngine) appendMatchingDateClauseIndexes(path []streamPathSegment, keyBytes []byte, clauseIdxs []int, dst []int) []int {
+	for _, clauseIdx := range clauseIdxs {
+		clause := &e.dateClauses[clauseIdx]
 		if e.hits[clause.id] || !streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 			continue
 		}
@@ -5143,12 +5591,32 @@ func (e *streamSelectorEngine) stringValueNeeded(path []streamPathSegment, keyBy
 			if e.hits[clause.id] {
 				continue
 			}
-			if streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			if clause.mode == rangeModeTemporal && streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
 				return true
 			}
 		}
 		for _, clauseIdx := range rangeAny {
 			clause := &e.rangeClauses[clauseIdx]
+			if e.hits[clause.id] {
+				continue
+			}
+			if clause.mode == rangeModeTemporal && streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+				return true
+			}
+		}
+
+		dateSpecific, dateAny := e.dateDispatch.candidates(path, keyBytes)
+		for _, clauseIdx := range dateSpecific {
+			clause := &e.dateClauses[clauseIdx]
+			if e.hits[clause.id] {
+				continue
+			}
+			if streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+				return true
+			}
+		}
+		for _, clauseIdx := range dateAny {
+			clause := &e.dateClauses[clauseIdx]
 			if e.hits[clause.id] {
 				continue
 			}
@@ -5194,6 +5662,17 @@ func (e *streamSelectorEngine) stringValueNeeded(path []streamPathSegment, keyBy
 	}
 	for i := range e.rangeClauses {
 		clause := &e.rangeClauses[i]
+		if e.hits[clause.id] {
+			continue
+		}
+		if clause.mode == rangeModeTemporal &&
+			streamPathTailMatches(clause.tailKind, clause.tailKeyBytes, clause.tailIndex, path, keyBytes) &&
+			streamPathMatchesKnownRecursive(clause.path, path, keyBytes, clause.hasRecursive, clause.singleRecursive, clause.recursiveIdx) {
+			return true
+		}
+	}
+	for i := range e.dateClauses {
+		clause := &e.dateClauses[i]
 		if e.hits[clause.id] {
 			continue
 		}

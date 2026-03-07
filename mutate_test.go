@@ -465,7 +465,9 @@ or.1.eq{field=/transaction/counterparty/country,value=NO}`
 	if eq := clauses["/transaction/status"]; eq.Eq == nil || eq.Eq.Value != "pending" {
 		t.Fatalf("unexpected status clause %+v", eq)
 	}
-	if rng := clauses["/transaction/amount/net"]; rng.Range == nil || rng.Range.GTE == nil || *rng.Range.GTE != 12000 {
+	if rng := clauses["/transaction/amount/net"]; rng.Range == nil {
+		t.Fatalf("unexpected range clause %+v", rng)
+	} else if value, ok := rng.Range.GTE.Number(); !ok || value != 12000 {
 		t.Fatalf("unexpected range clause %+v", rng)
 	}
 	seen := make(map[string]bool)
@@ -544,7 +546,9 @@ or.1.eq{field=/voucher/lines/10/dimensions/cost_center,value=AMS}`
 	if clause := clauses["/voucher/header/period"]; clause.Eq.Value != "2025-11" {
 		t.Fatalf("unexpected period clause %+v", clause)
 	}
-	if rng := clauses["/voucher/lines/20/amount"]; rng.Range == nil || rng.Range.GTE == nil || *rng.Range.GTE != 3000 {
+	if rng := clauses["/voucher/lines/20/amount"]; rng.Range == nil {
+		t.Fatalf("unexpected range term %+v", rng)
+	} else if value, ok := rng.Range.GTE.Number(); !ok || value != 3000 {
 		t.Fatalf("unexpected range term %+v", rng)
 	}
 	regions := make(map[string]bool)
@@ -627,10 +631,14 @@ or.1.eq{field=/device/location/region,value=ap-south}`
 			t.Fatalf("missing eq clause for %s", field)
 		}
 	}
-	if rng := clauses["/device/rollout/progress/percent"]; rng.Range == nil || rng.Range.GTE == nil || *rng.Range.GTE != 30 {
+	if rng := clauses["/device/rollout/progress/percent"]; rng.Range == nil {
+		t.Fatalf("unexpected rollout range %+v", rng)
+	} else if value, ok := rng.Range.GTE.Number(); !ok || value != 30 {
 		t.Fatalf("unexpected rollout range %+v", rng)
 	}
-	if rng := clauses["/device/telemetry/battery_mv"]; rng.Range == nil || rng.Range.GTE == nil || *rng.Range.GTE != 3600 {
+	if rng := clauses["/device/telemetry/battery_mv"]; rng.Range == nil {
+		t.Fatalf("unexpected telemetry range %+v", rng)
+	} else if value, ok := rng.Range.GTE.Number(); !ok || value != 3600 {
 		t.Fatalf("unexpected telemetry range %+v", rng)
 	}
 	expectedRegions := map[string]bool{"us-west": false, "ap-south": false}

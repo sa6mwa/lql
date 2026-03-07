@@ -9,6 +9,7 @@ type SelectorCapabilities struct {
 	Not      bool
 	Eq       bool
 	Range    bool
+	Date     bool
 	In       bool
 	Prefix   bool
 	Contains bool
@@ -30,7 +31,7 @@ type SelectorExecutionTraits struct {
 
 // Families returns sorted selector clause families referenced by the selector.
 func (c SelectorCapabilities) Families() []string {
-	families := make([]string, 0, 9)
+	families := make([]string, 0, 10)
 	if c.And {
 		families = append(families, "and")
 	}
@@ -45,6 +46,9 @@ func (c SelectorCapabilities) Families() []string {
 	}
 	if c.Range {
 		families = append(families, "range")
+	}
+	if c.Date {
+		families = append(families, "date")
 	}
 	if c.In {
 		families = append(families, "in")
@@ -111,6 +115,10 @@ func inspectSelectorCapabilities(capabilities *SelectorCapabilities, sel Selecto
 	if sel.Range != nil {
 		capabilities.Range = true
 		inspectSelectorPathComplexity(capabilities, sel.Range.Field)
+	}
+	if sel.Date != nil {
+		capabilities.Date = true
+		inspectSelectorPathComplexity(capabilities, sel.Date.Field)
 	}
 	if sel.In != nil {
 		capabilities.In = true

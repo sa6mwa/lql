@@ -20,6 +20,7 @@ var selectorRoots = map[string]struct{}{
 	"prefix":    {},
 	"iprefix":   {},
 	"range":     {},
+	"date":      {},
 	"in":        {},
 	"exists":    {},
 }
@@ -149,23 +150,42 @@ func rewriteShorthandExpression(expr string) (string, bool, error) {
 	if err != nil || !ok {
 		return "", ok && err == nil, err
 	}
-	forceNumeric := op == ">" || op == ">=" || op == "<" || op == "<="
-	literal, err := normalizeShorthandValue(value, forceNumeric)
-	if err != nil {
-		return "", false, err
-	}
 	switch op {
 	case "=", "==":
+		literal, err := normalizeShorthandValue(value, false)
+		if err != nil {
+			return "", false, err
+		}
 		return fmt.Sprintf("eq{field=%s,value=%s}", field, literal), true, nil
 	case "!=":
+		literal, err := normalizeShorthandValue(value, false)
+		if err != nil {
+			return "", false, err
+		}
 		return fmt.Sprintf("not.eq{field=%s,value=%s}", field, literal), true, nil
 	case ">":
+		literal, err := normalizeShorthandRangeValue(value)
+		if err != nil {
+			return "", false, err
+		}
 		return fmt.Sprintf("range{field=%s,gt=%s}", field, literal), true, nil
 	case ">=":
+		literal, err := normalizeShorthandRangeValue(value)
+		if err != nil {
+			return "", false, err
+		}
 		return fmt.Sprintf("range{field=%s,gte=%s}", field, literal), true, nil
 	case "<":
+		literal, err := normalizeShorthandRangeValue(value)
+		if err != nil {
+			return "", false, err
+		}
 		return fmt.Sprintf("range{field=%s,lt=%s}", field, literal), true, nil
 	case "<=":
+		literal, err := normalizeShorthandRangeValue(value)
+		if err != nil {
+			return "", false, err
+		}
 		return fmt.Sprintf("range{field=%s,lte=%s}", field, literal), true, nil
 	default:
 		return "", false, nil
@@ -273,6 +293,27 @@ func normalizeShorthandValue(raw string, numericOnly bool) (string, error) {
 		return fmt.Sprintf("\"%s\"", trimmed), nil
 	}
 	return string(buf), nil
+}
+
+func normalizeShorthandRangeValue(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("selector shorthand missing value")
+	}
+	unquoted, quoted := stripQuotes(trimmed)
+	if !quoted {
+		if _, err := strconv.ParseFloat(unquoted, 64); err == nil {
+			return unquoted, nil
+		}
+	}
+	if _, ok := parseTemporalLiteral(unquoted); ok {
+		buf, err := json.Marshal(unquoted)
+		if err != nil {
+			return "", err
+		}
+		return string(buf), nil
+	}
+	return "", fmt.Errorf("range comparisons require numeric or datetime literals")
 }
 
 func parseSelectorValuesInternal(values url.Values) (Selector, bool, error) {
@@ -588,20 +629,22 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 			defer clause.endSticky()
 		}
 		term := firstToken(clauseTokens)
-		for _, field := range keys {
+		for _, rawField := range keys {
+			field := normalizeSelectorInlineField(term, rawField)
+			rawValue := fields[rawField]
 			if term == "exists" && field == "" {
 				if len(keys) != 1 {
 					return fmt.Errorf("exists selector accepts a single value")
 				}
-				if err := clause.assign(clauseTokens, fields[field]); err != nil {
+				if err := clause.assign(clauseTokens, rawValue); err != nil {
 					return err
 				}
 				continue
 			}
 			path := append(clauseTokens, field)
-			value := convertSelectorValue(fields[field])
+			value := convertSelectorValue(rawValue)
 			if term == "in" && field == "any" {
-				any, err := parseInAny(fields[field])
+				any, err := parseInAny(rawValue)
 				if err != nil {
 					return err
 				}
@@ -618,20 +661,22 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 		defer b.base.endSticky()
 	}
 	term := firstToken(tokens)
-	for _, field := range keys {
+	for _, rawField := range keys {
+		field := normalizeSelectorInlineField(term, rawField)
+		rawValue := fields[rawField]
 		if term == "exists" && field == "" {
 			if len(keys) != 1 {
 				return fmt.Errorf("exists selector accepts a single value")
 			}
-			if err := b.base.assign(tokens, fields[field]); err != nil {
+			if err := b.base.assign(tokens, rawValue); err != nil {
 				return err
 			}
 			continue
 		}
 		path := append(tokens, field)
-		value := convertSelectorValue(fields[field])
+		value := convertSelectorValue(rawValue)
 		if term == "in" && field == "any" {
-			any, err := parseInAny(fields[field])
+			any, err := parseInAny(rawValue)
 			if err != nil {
 				return err
 			}
@@ -974,11 +1019,39 @@ func normalizeSelectorKey(key string) string {
 		return "value"
 	case "ic":
 		return "ignoreCase"
-	case "a":
-		return "any"
 	default:
 		return key
 	}
+}
+
+func normalizeSelectorInlineField(term, field string) string {
+	lowerField := strings.ToLower(strings.TrimSpace(field))
+	switch lowerField {
+	case "f":
+		return "field"
+	case "v":
+		return "value"
+	case "ic":
+		return "ignoreCase"
+	}
+	switch strings.ToLower(strings.TrimSpace(term)) {
+	case "date":
+		if lowerField == "a" {
+			return "after"
+		}
+		if lowerField == "b" {
+			return "before"
+		}
+	case "contains", "icontains", "in":
+		if lowerField == "a" {
+			return "any"
+		}
+	case "eq", "prefix", "iprefix":
+		if lowerField == "a" {
+			return "any"
+		}
+	}
+	return lowerField
 }
 
 func firstToken(tokens []string) string {

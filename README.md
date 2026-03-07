@@ -74,6 +74,70 @@ Shorthand forms are supported:
 sel, _ := lql.ParseSelectorString(`/status="open",/progress>=50`)
 ```
 
+Datetime literals are also supported in shorthand range comparisons:
+
+```go
+sel, _ := lql.ParseSelectorString(`/timestamp>=2026-03-05T10:28:21Z`)
+sel, _ = lql.ParseSelectorString(`/timestamp<"2026-03-05T11:29:41.265+01:00"`)
+```
+
+`eq` shorthand is datetime-aware when both sides parse as temporal values:
+
+```go
+sel, _ := lql.ParseSelectorString(`/timestamp="2025-01-01"`)
+// Matches values such as "2025-01-01T15:00:00Z" (date-only intersection).
+```
+
+Explicit date selectors are available for intent and macro support:
+
+```go
+sel, _ := lql.ParseSelectorString(`date{field=/timestamp,after=2025-01-01,before=2025-02-01}`)
+sel, _ = lql.ParseSelectorString(`date{f=/timestamp,a=2025-01-01,b=2025-01-03}`)
+sel, _ = lql.ParseSelectorString(`date{f=/timestamp,since=yesterday}`)
+```
+
+Programmatic range-term construction can use exported bound helpers:
+
+```go
+sel := lql.Selector{
+  Range: &lql.RangeTerm{
+    Field: "/timestamp",
+    GTE:   lql.NewDatetimeRangeBound("2026-03-05T10:28:21Z"),
+    LT:    lql.NewDatetimeRangeBound("2026-03-05T10:30:00Z"),
+  },
+}
+```
+
+Temporal behavior summary:
+
+- Supported temporal literals: `YYYY-MM-DD`, RFC3339, RFC3339Nano.
+- Timezones are normalized to the same instant for datetime comparison.
+- `range{...}` supports numeric or datetime bounds (`gt/gte/lt/lte`) but cannot mix numeric and datetime bounds in one clause.
+- Relative macros are only supported by `date{...,since=...}` (`now`, `today`, `yesterday`).
+- Shorthand/range comparators require explicit numeric or datetime literals (no macros).
+
+Temporal selector performance note (measured on March 5, 2026, synthetic benchmark, `go test` on Intel i7-1355U):
+
+```bash
+go test . -run '^$' \
+  -bench '^BenchmarkQueryStreamSynthetic/(large_ndjson$|large_ndjson_datetime_range$|large_ndjson_date_selector$)/decision_only_selector/steady_state$' \
+  -benchmem -benchtime=500ms -count=5
+```
+
+- `large_ndjson/decision_only_selector/steady_state`: ~`10.25 ms/op`, `0 B/op`, `0 allocs/op`
+- `large_ndjson_datetime_range/decision_only_selector/steady_state`: ~`16.33 ms/op`, `0 B/op`, `0 allocs/op` (~`1.59x`)
+- `large_ndjson_date_selector/decision_only_selector/steady_state`: ~`16.29 ms/op`, `0 B/op`, `0 allocs/op` (~`1.59x`)
+
+Interpretation: temporal selectors keep zero steady-state allocations, but runtime is higher than plain string equality because candidate values are parsed as datetimes during matching.
+
+Fuzz-style alloc regression guard:
+
+- `TestQueryStreamSelectorAllocBudgetFuzzReplayTemporal` replays deterministic
+  parity-fuzz payloads and enforces per-candidate allocation ceilings for
+  temporal shorthand/range/date selectors.
+- This runs in normal `go test` (and therefore `make test`, `make test-all`,
+  `make test-all-full`) to catch alloc regressions without fuzz nondeterminism.
+
 If you want implicit OR semantics across a single string, use
 `ParseSelectorStringOr`:
 
@@ -286,12 +350,29 @@ lql 'contains{field=/msg,any=timeout|degraded},icontains{field=/service,a=AUTH|E
 lql 'icontains{field=/msg,value=timeout},iprefix{field=/service,value=auth}' data.json
 ```
 
+```bash
+lql '/timestamp>=2026-03-05T10:28:21Z' data.json
+```
+
+```bash
+lql 'date{field=/timestamp,after=2025-01-01,before=2025-02-01}' data.json
+```
+
+```bash
+lql 'date{f=/timestamp,a=2025-01-01,b=2025-01-03}' data.json
+```
+
+```bash
+lql 'date{f=/timestamp,since=yesterday}' data.json
+```
+
 Note: full LQL expressions use `{}` and should be quoted (or the braces
 escaped) to avoid shell brace expansion.
 
 Note: inside `{}`, you can use `f=`/`v=` as aliases for `field=`/`value=`, `a=`
 as an alias for `any=` (`in`, `contains`, and `icontains`), and `ic=` as an
 alias for `ignoreCase=` in string terms (`contains`/`prefix`).
+For `date`, `a=` is an alias for `after=` and `b=` is an alias for `before=`.
 `ignoreCase` accepts `true/false` or shorthand `t/f`.
 
 Note: omitted string values stay field-scoped. For example
@@ -343,6 +424,16 @@ sel, err := lql.ParseSelectorString(
 sel, err := lql.ParseSelectorString(
   "contains{field=/msg,any=timeout|degraded},icontains{field=/service,a=AUTH|EDGE}",
 )
+```
+
+```go
+sel, err := lql.ParseSelectorString(
+  "date{field=/timestamp,after=2025-01-01,before=2025-02-01}",
+)
+```
+
+```go
+sel, err := lql.ParseSelectorString("date{f=/timestamp,since=yesterday}")
 ```
 
 Select only a few fields from matching documents:
@@ -418,10 +509,14 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 ## Selector grammar overview
 
 - Logical: `and`, `or`, `not`
-- Clauses: `eq`, `contains`, `icontains`, `prefix`, `iprefix`, `range`, `in`, `exists`
+- Clauses: `eq`, `contains`, `icontains`, `prefix`, `iprefix`, `range`, `date`, `in`, `exists`
 - `contains`/`icontains` support `value=` (single term) or `any=`/`a=` (pipe-delimited terms)
 - JSON Pointer fields: `/path/to/field`
 - Shorthand: `/field=value`, `/field!=value`, `/field>=10`, `/field<5`
+- Datetime shorthand: `/timestamp>=2026-03-05T10:28:21Z`, `/timestamp<"2026-03-05T11:29:41.265+01:00"`
+- `range` bounds: `gt`, `gte`, `lt`, `lte` with numeric or datetime literals (single-mode per clause)
+- `date` keys: `value`, `after`/`a`, `before`/`b`, `gt`, `gte`, `lt`, `lte`, `since`
+- `date.since` macros: `now`, `today`, `yesterday`
 - Arrays: `/items/0/sku="ABC-123"`
 - Wildcards: `*` (object values), `[]` (array elements), `**` (any child), `...` (recursive descent)
 

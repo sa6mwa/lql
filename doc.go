@@ -16,6 +16,10 @@
 //	prefix{field=/owner,value=team-}
 //	iprefix{field=/owner,value=team-}
 //	range{field=/progress,gt=10}
+//	range{field=/timestamp,gte="2026-03-05T10:28:21Z"}
+//	date{field=/timestamp,after=2025-01-01,before=2025-02-01}
+//	date{f=/timestamp,a=2025-01-01,b=2025-01-03}
+//	date{f=/timestamp,since=yesterday}
 //	in{field=/state,any=["queued","running"]}
 //	exists{/metadata/etag}
 //
@@ -41,6 +45,21 @@
 //	/status="open"
 //	/status!=closed
 //	/progress>=50
+//	/timestamp>=2026-03-05T10:28:21Z
+//	/timestamp<"2026-03-05T11:29:41.265+01:00"
+//
+// Temporal selector semantics:
+//
+//   - Supported temporal literals: YYYY-MM-DD, RFC3339, RFC3339Nano.
+//   - eq is datetime-aware when both query value and field value parse as
+//     temporal values.
+//   - Date-only equality intersects timestamps by calendar date
+//     (for example "2025-01-01" matches "2025-01-01T15:00:00Z").
+//   - range supports numeric or datetime bounds (gt/gte/lt/lte), but does not
+//     allow mixed numeric + datetime bounds in one clause.
+//   - Programmatic range construction can use NewNumericRangeBound and
+//     NewDatetimeRangeBound.
+//   - date.since supports relative macros now/today/yesterday.
 //
 // Arrays:
 //

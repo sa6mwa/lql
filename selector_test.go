@@ -338,7 +338,10 @@ func TestParseSelectorStringExplicitAndIndexMerges(t *testing.T) {
 	if clause.Eq == nil || clause.Eq.Field != "/status" || clause.Eq.Value != "ok" {
 		t.Fatalf("unexpected eq clause %+v", clause)
 	}
-	if clause.Range == nil || clause.Range.Field != "/progress" || clause.Range.GTE == nil || *clause.Range.GTE != 10 {
+	if clause.Range == nil || clause.Range.Field != "/progress" {
+		t.Fatalf("unexpected range clause %+v", clause)
+	}
+	if value, ok := clause.Range.GTE.Number(); !ok || value != 10 {
 		t.Fatalf("unexpected range clause %+v", clause)
 	}
 }
@@ -356,7 +359,10 @@ func TestParseSelectorStringExplicitOrIndexMerges(t *testing.T) {
 	if clause.Eq == nil || clause.Eq.Field != "/status" || clause.Eq.Value != "ok" {
 		t.Fatalf("unexpected eq clause %+v", clause)
 	}
-	if clause.Range == nil || clause.Range.Field != "/progress" || clause.Range.GTE == nil || *clause.Range.GTE != 10 {
+	if clause.Range == nil || clause.Range.Field != "/progress" {
+		t.Fatalf("unexpected range clause %+v", clause)
+	}
+	if value, ok := clause.Range.GTE.Number(); !ok || value != 10 {
 		t.Fatalf("unexpected range clause %+v", clause)
 	}
 }
@@ -424,7 +430,10 @@ func TestParseSelectorShorthand(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse shorthand >: %v", err)
 		}
-		if sel.Range == nil || sel.Range.Field != "/progress/count" || sel.Range.GT == nil || *sel.Range.GT != 10 {
+		if sel.Range == nil || sel.Range.Field != "/progress/count" {
+			t.Fatalf("unexpected range selector %+v", sel.Range)
+		}
+		if value, ok := sel.Range.GT.Number(); !ok || value != 10 {
 			t.Fatalf("unexpected range selector %+v", sel.Range)
 		}
 	})
@@ -434,7 +443,10 @@ func TestParseSelectorShorthand(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse shorthand >=: %v", err)
 		}
-		if sel.Range == nil || sel.Range.GTE == nil || *sel.Range.GTE != 42 {
+		if sel.Range == nil {
+			t.Fatalf("unexpected gte selector %+v", sel.Range)
+		}
+		if value, ok := sel.Range.GTE.Number(); !ok || value != 42 {
 			t.Fatalf("unexpected gte selector %+v", sel.Range)
 		}
 	})
@@ -444,7 +456,10 @@ func TestParseSelectorShorthand(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse shorthand <=: %v", err)
 		}
-		if sel.Range == nil || sel.Range.LTE == nil || *sel.Range.LTE != 3600 {
+		if sel.Range == nil {
+			t.Fatalf("unexpected lte selector %+v", sel.Range)
+		}
+		if value, ok := sel.Range.LTE.Number(); !ok || value != 3600 {
 			t.Fatalf("unexpected lte selector %+v", sel.Range)
 		}
 	})
@@ -454,6 +469,64 @@ func TestParseSelectorShorthand(t *testing.T) {
 			t.Fatalf("expected error for missing value")
 		}
 	})
+
+	t.Run("datetime gte", func(t *testing.T) {
+		sel, err := ParseSelectorString(`/timestamp>="2025-01-01"`)
+		if err != nil {
+			t.Fatalf("parse shorthand datetime >=: %v", err)
+		}
+		if sel.Range == nil {
+			t.Fatalf("expected range clause")
+		}
+		if value, ok := sel.Range.GTE.DateTime(); !ok || value != "2025-01-01" {
+			t.Fatalf("unexpected datetime gte selector %+v", sel.Range)
+		}
+	})
+
+	t.Run("datetime lt", func(t *testing.T) {
+		sel, err := ParseSelectorString(`/timestamp<2025-01-01T12:00:00Z`)
+		if err != nil {
+			t.Fatalf("parse shorthand datetime <: %v", err)
+		}
+		if sel.Range == nil {
+			t.Fatalf("expected range clause")
+		}
+		if value, ok := sel.Range.LT.DateTime(); !ok || value != "2025-01-01T12:00:00Z" {
+			t.Fatalf("unexpected datetime lt selector %+v", sel.Range)
+		}
+	})
+
+	t.Run("range macro disallowed", func(t *testing.T) {
+		if _, err := ParseSelectorString(`/timestamp>=yesterday`); err == nil {
+			t.Fatalf("expected error for relative macro in shorthand range")
+		}
+	})
+}
+
+func TestParseSelectorDateSelectorAliases(t *testing.T) {
+	sel, err := ParseSelectorString(`date{f=/timestamp,a=2025-01-01,b=2025-01-03}`)
+	if err != nil {
+		t.Fatalf("parse date selector: %v", err)
+	}
+	if sel.Date == nil {
+		t.Fatalf("expected date clause")
+	}
+	if sel.Date.Field != "/timestamp" {
+		t.Fatalf("unexpected date field: %+v", sel.Date)
+	}
+	if sel.Date.After != "2025-01-01" || sel.Date.Before != "2025-01-03" {
+		t.Fatalf("unexpected date aliases: %+v", sel.Date)
+	}
+}
+
+func TestParseSelectorDateSelectorSinceMacro(t *testing.T) {
+	sel, err := ParseSelectorString(`date{f=/timestamp,since=yesterday}`)
+	if err != nil {
+		t.Fatalf("parse date selector since: %v", err)
+	}
+	if sel.Date == nil || sel.Date.Since != "yesterday" {
+		t.Fatalf("unexpected date since clause %+v", sel.Date)
+	}
 }
 
 func TestParseSelectorInlineAliases(t *testing.T) {
