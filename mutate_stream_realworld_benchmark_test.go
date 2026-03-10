@@ -22,14 +22,14 @@ func BenchmarkMutateStreamRealworld(b *testing.B) {
 		mutations []string
 	}{
 		{name: "set_top_level_dense", mutations: []string{`/component=lql`}},
-		{name: "set_top_level_sparse", mutations: []string{`/event=tabs_update`}},
+		{name: "set_top_level_sparse", mutations: []string{`/event=session_sync`}},
 		{name: "set_nested_sparse", mutations: []string{`/query/hash=ff`}},
 		{name: "increment_sparse", mutations: []string{`/code=+1`}},
 		{name: "remove_sparse", mutations: []string{`rm:/payload`}},
 		{name: "create_nested_dense", mutations: []string{`/meta/bench=true`}},
 		{
 			name:      "multi_mutation",
-			mutations: []string{`/component=lql`, `/event=tabs_update`, `/code=+1`, `rm:/payload`, `/meta/bench=true`},
+			mutations: []string{`/component=lql`, `/event=session_sync`, `/code=+1`, `rm:/payload`, `/meta/bench=true`},
 		},
 	}
 

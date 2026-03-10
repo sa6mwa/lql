@@ -1,6 +1,6 @@
 module pkt.systems/lql
 
-go 1.25
+go 1.25.0
 
 require (
 	pkt.systems/prettyx v0.4.0
@@ -10,6 +10,6 @@ require (
 require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/spf13/pflag v1.0.10
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 	pkt.systems/jpact v0.1.0 // indirect
 )

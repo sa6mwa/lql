@@ -30,6 +30,9 @@ func validateSelectorSemantics(sel Selector) error {
 	if err := validateDateTerm(sel.Date, time.Now()); err != nil {
 		return err
 	}
+	if err := validateInTerm(sel.In); err != nil {
+		return err
+	}
 	if sel.Not != nil {
 		if err := validateSelectorSemantics(*sel.Not); err != nil {
 			return err
@@ -43,6 +46,24 @@ func validateSelectorSemantics(sel Selector) error {
 	for _, child := range sel.Or {
 		if err := validateSelectorSemantics(child); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func validateInTerm(term *InTerm) error {
+	if term == nil {
+		return nil
+	}
+	if term.Field == "" {
+		return fmt.Errorf("in selector field required")
+	}
+	if len(term.Any) == 0 {
+		return fmt.Errorf("in selector requires at least one any value")
+	}
+	for _, candidate := range term.Any {
+		if candidate == "" {
+			return fmt.Errorf("in selector requires non-empty any values")
 		}
 	}
 	return nil

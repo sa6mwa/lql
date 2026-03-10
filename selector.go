@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,7 +81,13 @@ func parseSelectorString(expr string, orMode bool) (Selector, error) {
 		if key == "" {
 			continue
 		}
+		if isMatchAllSelectorAlias(key) {
+			continue
+		}
 		first := firstSelectorToken(key)
+		if first == "" {
+			return Selector{}, fmt.Errorf("invalid selector expression %q", token)
+		}
 		if implicitAnd {
 			if first != "" && first != "and" && first != "or" {
 				key = "and." + key
@@ -94,6 +101,15 @@ func parseSelectorString(expr string, orMode bool) (Selector, error) {
 		values.Add(key, "")
 	}
 	return ParseSelectorValues(values)
+}
+
+func isMatchAllSelectorAlias(expr string) bool {
+	switch strings.TrimSpace(expr) {
+	case "", "{}", ".", "/":
+		return true
+	default:
+		return false
+	}
 }
 
 // ParseSelectorStrings parses each selector expression and combines them with AND.
@@ -319,7 +335,19 @@ func normalizeShorthandRangeValue(raw string) (string, error) {
 func parseSelectorValuesInternal(values url.Values) (Selector, bool, error) {
 	builder := newSelectorBuilder()
 	found := false
-	for rawKey, vals := range values {
+	type selectorValueGroup struct {
+		tokens []string
+		fields map[string]string
+	}
+	keys := make([]string, 0, len(values))
+	for rawKey := range values {
+		keys = append(keys, rawKey)
+	}
+	sort.Strings(keys)
+	grouped := make(map[string]*selectorValueGroup)
+	groupOrder := make([]string, 0, len(keys))
+	for _, rawKey := range keys {
+		vals := values[rawKey]
 		key := strings.TrimSpace(rawKey)
 		if key == "" {
 			continue
@@ -345,8 +373,34 @@ func parseSelectorValuesInternal(values url.Values) (Selector, bool, error) {
 		value := ""
 		if len(vals) > 0 {
 			value = vals[len(vals)-1]
+			for _, candidate := range vals[:len(vals)-1] {
+				if candidate != value {
+					return Selector{}, false, fmt.Errorf("selector expression %q has duplicate values", key)
+				}
+			}
 		}
-		if err := builder.assign(tokens, nil, value); err != nil {
+		clauseTokens, field, err := splitSelectorValueAssignment(tokens)
+		if err != nil {
+			return Selector{}, false, err
+		}
+		groupKey := strings.Join(clauseTokens, "\x00")
+		group, ok := grouped[groupKey]
+		if !ok {
+			group = &selectorValueGroup{
+				tokens: append([]string(nil), clauseTokens...),
+				fields: make(map[string]string, 4),
+			}
+			grouped[groupKey] = group
+			groupOrder = append(groupOrder, groupKey)
+		}
+		if existing, exists := group.fields[field]; exists && existing != value {
+			return Selector{}, false, fmt.Errorf("selector expression %q has duplicate key %q", key, field)
+		}
+		group.fields[field] = value
+	}
+	for _, groupKey := range groupOrder {
+		group := grouped[groupKey]
+		if err := builder.assignInline(group.tokens, group.fields); err != nil {
 			return Selector{}, false, err
 		}
 	}
@@ -388,14 +442,14 @@ func parseSelectorKey(key string) ([]string, map[string]string, error) {
 		}
 		content := raw[start+1 : len(raw)-1]
 		raw = strings.TrimSpace(raw[:start])
-		tokens := splitTokens(raw)
-		if len(tokens) == 0 {
-			return nil, nil, fmt.Errorf("selector path %q empty", key)
+		tokens, err := splitSelectorPath(raw)
+		if err != nil {
+			return nil, nil, err
 		}
-		allowBare := len(tokens) > 0 && tokens[0] == "exists"
-		if !allowBare && len(tokens) > 1 && (tokens[0] == "or" || tokens[0] == "and") && tokens[1] == "exists" {
-			allowBare = true
+		if err := validateSelectorClauseTokens(tokens); err != nil {
+			return nil, nil, err
 		}
+		allowBare := selectorLeafTerm(tokens) == "exists"
 		assignments, err := parseInlineAssignments(content, allowBare)
 		if err != nil {
 			return nil, nil, err
@@ -403,20 +457,53 @@ func parseSelectorKey(key string) ([]string, map[string]string, error) {
 		inline = assignments
 		return tokens, inline, nil
 	}
-	tokens := splitTokens(raw)
-	if len(tokens) == 0 {
-		return nil, nil, fmt.Errorf("selector path %q empty", key)
+	tokens, err := splitSelectorPath(raw)
+	if err != nil {
+		return nil, nil, err
 	}
 	return tokens, inline, nil
 }
 
-func splitTokens(raw string) []string {
+func splitSelectorValueAssignment(tokens []string) ([]string, string, error) {
+	if len(tokens) == 0 {
+		return nil, "", fmt.Errorf("selector path empty")
+	}
+	leafIdx := selectorLeafTermIndex(tokens)
+	if leafIdx < 0 {
+		return nil, "", fmt.Errorf("selector path %q missing term", strings.Join(tokens, "."))
+	}
+	term := selectorLeafTerm(tokens)
+	if term == "exists" {
+		if leafIdx != len(tokens)-1 {
+			return nil, "", fmt.Errorf("exists selector accepts a single value")
+		}
+		clauseTokens := append([]string(nil), tokens...)
+		if err := validateSelectorClauseTokens(clauseTokens); err != nil {
+			return nil, "", err
+		}
+		return clauseTokens, "", nil
+	}
+	if leafIdx != len(tokens)-2 {
+		return nil, "", fmt.Errorf("selector path %q missing key", strings.Join(tokens, "."))
+	}
+	field := tokens[len(tokens)-1]
+	if strings.TrimSpace(field) == "" {
+		return nil, "", fmt.Errorf("selector path %q missing key", strings.Join(tokens, "."))
+	}
+	clauseTokens := append([]string(nil), tokens[:len(tokens)-1]...)
+	if err := validateSelectorClauseTokens(clauseTokens); err != nil {
+		return nil, "", err
+	}
+	return clauseTokens, field, nil
+}
+
+func splitSelectorPath(raw string) ([]string, error) {
 	parts := strings.Split(raw, ".")
 	tokens := make([]string, 0, len(parts))
 	for _, part := range parts {
 		trimmed := strings.TrimSpace(part)
 		if trimmed == "" {
-			continue
+			return nil, fmt.Errorf("selector path %q has empty segment", raw)
 		}
 		lower := strings.ToLower(trimmed)
 		if _, ok := selectorRoots[lower]; ok {
@@ -425,7 +512,10 @@ func splitTokens(raw string) []string {
 			tokens = append(tokens, trimmed)
 		}
 	}
-	return tokens
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("selector path %q empty", raw)
+	}
+	return tokens, nil
 }
 
 func splitExpressions(input string) ([]string, error) {
@@ -433,6 +523,7 @@ func splitExpressions(input string) ([]string, error) {
 	var chunk strings.Builder
 	depth := 0
 	inQuotes := false
+	var quote rune
 	escape := false
 	flush := func() {
 		if chunk.Len() == 0 {
@@ -449,8 +540,14 @@ func splitExpressions(input string) ([]string, error) {
 		case r == '\\':
 			escape = true
 			chunk.WriteRune(r)
-		case r == '"':
-			inQuotes = !inQuotes
+		case r == '"' || r == '\'':
+			if !inQuotes {
+				inQuotes = true
+				quote = r
+			} else if quote == r {
+				inQuotes = false
+				quote = 0
+			}
 			chunk.WriteRune(r)
 		case r == '{' && !inQuotes:
 			depth++
@@ -524,6 +621,7 @@ func splitAssignmentTokens(input string, allowBare bool) ([]string, error) {
 	var tokens []string
 	var chunk strings.Builder
 	inQuotes := false
+	var quote rune
 	escape := false
 	seenEqual := false
 	valueStarted := false
@@ -561,8 +659,14 @@ func splitAssignmentTokens(input string, allowBare bool) ([]string, error) {
 		case r == '\\':
 			escape = true
 			chunk.WriteRune(r)
-		case r == '"':
-			inQuotes = !inQuotes
+		case r == '"' || r == '\'':
+			if !inQuotes {
+				inQuotes = true
+				quote = r
+			} else if quote == r {
+				inQuotes = false
+				quote = 0
+			}
 			if seenEqual {
 				valueStarted = true
 			}
@@ -598,6 +702,41 @@ func splitAssignmentTokens(input string, allowBare bool) ([]string, error) {
 	return tokens, nil
 }
 
+func validateSelectorClauseTokens(tokens []string) error {
+	if len(tokens) == 0 {
+		return fmt.Errorf("selector path empty")
+	}
+	for i := 0; i < len(tokens); {
+		token := strings.ToLower(strings.TrimSpace(tokens[i]))
+		switch token {
+		case "and", "or":
+			i++
+			if i < len(tokens) && looksLikeIndex(tokens[i]) {
+				i++
+			}
+			if i >= len(tokens) {
+				return fmt.Errorf("selector path %q missing term", strings.Join(tokens, "."))
+			}
+		case "not":
+			i++
+			if i >= len(tokens) {
+				return fmt.Errorf("selector path %q missing term", strings.Join(tokens, "."))
+			}
+		case "eq", "contains", "icontains", "prefix", "iprefix", "range", "date", "in", "exists":
+			if i != len(tokens)-1 {
+				return fmt.Errorf("selector path %q has unexpected segment %q", strings.Join(tokens, "."), tokens[i+1])
+			}
+			return nil
+		default:
+			if looksLikeIndex(token) {
+				return fmt.Errorf("selector path %q has unexpected index %q", strings.Join(tokens, "."), tokens[i])
+			}
+			return fmt.Errorf("selector path %q has unexpected segment %q", strings.Join(tokens, "."), tokens[i])
+		}
+	}
+	return fmt.Errorf("selector path %q missing term", strings.Join(tokens, "."))
+}
+
 // selectorBuilder routes assignments to the base clause or dedicated OR clauses.
 type selectorBuilder struct {
 	base      *clauseBuilder
@@ -628,7 +767,7 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 			clause.beginSticky(sticky)
 			defer clause.endSticky()
 		}
-		term := firstToken(clauseTokens)
+		term := selectorLeafTerm(clauseTokens)
 		for _, rawField := range keys {
 			field := normalizeSelectorInlineField(term, rawField)
 			rawValue := fields[rawField]
@@ -636,10 +775,13 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 				if len(keys) != 1 {
 					return fmt.Errorf("exists selector accepts a single value")
 				}
-				if err := clause.assign(clauseTokens, rawValue); err != nil {
+				if err := clause.assign(clauseTokens, normalizeSelectorBareValue(rawValue)); err != nil {
 					return err
 				}
 				continue
+			}
+			if err := validateSelectorInlineField(term, field); err != nil {
+				return err
 			}
 			path := append(clauseTokens, field)
 			value := convertSelectorValue(rawValue)
@@ -660,7 +802,7 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 		b.base.beginSticky(sticky)
 		defer b.base.endSticky()
 	}
-	term := firstToken(tokens)
+	term := selectorLeafTerm(tokens)
 	for _, rawField := range keys {
 		field := normalizeSelectorInlineField(term, rawField)
 		rawValue := fields[rawField]
@@ -668,10 +810,13 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 			if len(keys) != 1 {
 				return fmt.Errorf("exists selector accepts a single value")
 			}
-			if err := b.base.assign(tokens, rawValue); err != nil {
+			if err := b.base.assign(tokens, normalizeSelectorBareValue(rawValue)); err != nil {
 				return err
 			}
 			continue
+		}
+		if err := validateSelectorInlineField(term, field); err != nil {
+			return err
 		}
 		path := append(tokens, field)
 		value := convertSelectorValue(rawValue)
@@ -687,23 +832,6 @@ func (b *selectorBuilder) assignInline(tokens []string, fields map[string]string
 		}
 	}
 	return nil
-}
-
-func (b *selectorBuilder) assign(tokens []string, tail []string, rawValue string) error {
-	fullPath := append(append([]string(nil), tokens...), tail...)
-	if len(fullPath) == 0 {
-		return fmt.Errorf("selector path empty")
-	}
-	value := convertSelectorValue(rawValue)
-	if fullPath[0] == "or" {
-		clauseTokens, clauseKey := b.normalizeOrPath(fullPath)
-		if len(clauseTokens) == 0 {
-			return fmt.Errorf("selector or requires child")
-		}
-		clause := b.orClauseFor(clauseKey)
-		return clause.assign(clauseTokens, value)
-	}
-	return b.base.assign(fullPath, value)
 }
 
 func (b *selectorBuilder) normalizeOrPath(path []string) ([]string, string) {
@@ -920,6 +1048,9 @@ func assignRecursive(node any, path []string, value any) (any, error) {
 		var err2 error
 		if last {
 			if arr[idx] != nil {
+				if reflect.DeepEqual(arr[idx], value) {
+					return arr, nil
+				}
 				return nil, fmt.Errorf("selector path conflict at %s", token)
 			}
 			arr[idx] = value
@@ -941,7 +1072,10 @@ func assignRecursive(node any, path []string, value any) (any, error) {
 		return nil, fmt.Errorf("selector path conflict at %s", token)
 	}
 	if last {
-		if _, exists := obj[token]; exists {
+		if existing, exists := obj[token]; exists {
+			if reflect.DeepEqual(existing, value) {
+				return obj, nil
+			}
 			return nil, fmt.Errorf("selector path conflict at %s", token)
 		}
 		obj[token] = value
@@ -984,6 +1118,14 @@ func convertSelectorValue(v string) any {
 		return true
 	case "false":
 		return false
+	}
+	return trimmed
+}
+
+func normalizeSelectorBareValue(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if unquoted, ok := stripQuotes(trimmed); ok {
+		return unquoted
 	}
 	return trimmed
 }
@@ -1031,7 +1173,7 @@ func normalizeSelectorInlineField(term, field string) string {
 		return "field"
 	case "v":
 		return "value"
-	case "ic":
+	case "ic", "ignorecase":
 		return "ignoreCase"
 	}
 	switch strings.ToLower(strings.TrimSpace(term)) {
@@ -1054,18 +1196,61 @@ func normalizeSelectorInlineField(term, field string) string {
 	return lowerField
 }
 
-func firstToken(tokens []string) string {
-	for _, token := range tokens {
-		if token == "" {
-			continue
-		}
-		lower := strings.ToLower(token)
-		if lower == "and" || lower == "or" {
-			continue
-		}
-		return lower
+func validateSelectorInlineField(term, field string) error {
+	if field == "" {
+		return fmt.Errorf("%s selector requires keyed assignments", term)
 	}
-	return ""
+	var allowed map[string]struct{}
+	switch strings.ToLower(strings.TrimSpace(term)) {
+	case "eq":
+		allowed = map[string]struct{}{"field": {}, "value": {}}
+	case "prefix", "iprefix":
+		allowed = map[string]struct{}{"field": {}, "value": {}, "ignoreCase": {}}
+	case "contains", "icontains":
+		allowed = map[string]struct{}{"field": {}, "value": {}, "any": {}, "ignoreCase": {}}
+	case "range":
+		allowed = map[string]struct{}{"field": {}, "gte": {}, "gt": {}, "lte": {}, "lt": {}}
+	case "date":
+		allowed = map[string]struct{}{"field": {}, "value": {}, "after": {}, "before": {}, "gte": {}, "gt": {}, "lte": {}, "lt": {}, "since": {}}
+	case "in":
+		allowed = map[string]struct{}{"field": {}, "any": {}}
+	default:
+		return fmt.Errorf("selector term %q invalid", term)
+	}
+	if _, ok := allowed[field]; !ok {
+		return fmt.Errorf("%s selector does not support key %q", term, field)
+	}
+	return nil
+}
+
+func selectorLeafTerm(tokens []string) string {
+	idx := selectorLeafTermIndex(tokens)
+	if idx < 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(tokens[idx]))
+}
+
+func selectorLeafTermIndex(tokens []string) int {
+	leafIdx := -1
+	for i, token := range tokens {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if looksLikeIndex(lower) {
+			continue
+		}
+		switch lower {
+		case "and", "or", "not":
+			continue
+		}
+		if _, ok := selectorRoots[lower]; ok {
+			leafIdx = i
+		}
+	}
+	return leafIdx
 }
 
 func stripQuotes(v string) (string, bool) {

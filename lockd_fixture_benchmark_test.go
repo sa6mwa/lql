@@ -17,7 +17,7 @@ func BenchmarkLockdFixtures(b *testing.B) {
 		b.Skipf("skip lockd fixture benchmark: %v", err)
 	}
 
-	selector, err := ParseSelectorString(`/event="tabs_update"`)
+	selector, err := ParseSelectorString(`/event="session_sync"`)
 	if err != nil {
 		b.Fatalf("parse selector: %v", err)
 	}

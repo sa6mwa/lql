@@ -3,9 +3,10 @@ package lql
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -14,6 +15,13 @@ type queryRealworldDataset struct {
 	name    string
 	payload []byte
 }
+
+const (
+	querySyntheticEventSparseTarget     = "session_sync"
+	querySyntheticComponentDenseTarget  = "edge"
+	querySyntheticHashSparseTarget      = "c5d2460186f7233c927e7db2dcc703c0a3a8e0d5f0d8a3c5b4f1e2d3c4b5a697"
+	querySyntheticSessionIDSparseTarget = "sid-0a3f-target"
+)
 
 var (
 	queryRealworldOnce sync.Once
@@ -34,19 +42,19 @@ func BenchmarkQueryStreamRealworld(b *testing.B) {
 		name string
 		expr string
 	}{
-		{name: "eq_sparse", expr: `/event="tabs_update"`},
-		{name: "eq_dense", expr: `/component="host"`},
+		{name: "eq_sparse", expr: `/event="session_sync"`},
+		{name: "eq_dense", expr: `/component="edge"`},
 		{name: "eq_none", expr: `/event="__nope__"`},
 		{name: "range_sparse", expr: `/code>=11`},
-		{name: "nested_eq_sparse", expr: `/query/hash="86dabea3b684cbc7d287ffb741ece4ef859771d4bbd78cb010c23a17adb96728"`},
-		{name: "array_eq_sparse", expr: `/session_ids[]="woprWEoK-1"`},
-		{name: "recursive_eq_sparse", expr: `/.../event="tabs_update"`},
-		{name: "recursive_nested_eq_sparse", expr: `/.../hash="86dabea3b684cbc7d287ffb741ece4ef859771d4bbd78cb010c23a17adb96728"`},
-		{name: "contains_event_sparse", expr: `contains{field=/event,value=tabs}`},
-		{name: "icontains_component_dense", expr: `icontains{field=/component,value=HOST}`},
-		{name: "contains_any_event_sparse", expr: `contains{field=/event,any=tabs|__nope__}`},
-		{name: "icontains_any_component_dense", expr: `icontains{field=/component,any=HOST|__nope__}`},
-		{name: "multi_clause_and", expr: `/component="host",/event="tabs_update",/active_idx=0,/tab_count=1,exists{/session_ids},/code>=10`},
+		{name: "nested_eq_sparse", expr: `/query/hash="c5d2460186f7233c927e7db2dcc703c0a3a8e0d5f0d8a3c5b4f1e2d3c4b5a697"`},
+		{name: "array_eq_sparse", expr: `/session_ids[]="sid-0a3f-target"`},
+		{name: "recursive_eq_sparse", expr: `/.../event="session_sync"`},
+		{name: "recursive_nested_eq_sparse", expr: `/.../hash="c5d2460186f7233c927e7db2dcc703c0a3a8e0d5f0d8a3c5b4f1e2d3c4b5a697"`},
+		{name: "contains_event_sparse", expr: `contains{field=/event,value=sync}`},
+		{name: "icontains_component_dense", expr: `icontains{field=/component,value=EDGE}`},
+		{name: "contains_any_event_sparse", expr: `contains{field=/event,any=sync|__nope__}`},
+		{name: "icontains_any_component_dense", expr: `icontains{field=/component,any=EDGE|__nope__}`},
+		{name: "multi_clause_and", expr: `/component="edge",/event="session_sync",/active_idx=0,/tab_count=1,exists{/session_ids},/code>=10`},
 	}
 
 	for _, ds := range datasets {
@@ -132,21 +140,23 @@ func BenchmarkQueryStreamRealworld(b *testing.B) {
 
 func loadQueryRealworldDatasets() ([]queryRealworldDataset, error) {
 	queryRealworldOnce.Do(func() {
-		paths := []struct {
-			name string
-			path string
+		profiles := []struct {
+			name          string
+			count         int
+			prettyStream  bool
+			nestedPayload bool
 		}{
-			{name: "stash_jsonl", path: filepath.Join("stash", "testdata.jsonl")},
-			{name: "stash_pretty_stream", path: filepath.Join("stash", "testdatapretty.jsonstream")},
+			{name: "synthetic_ndjson_compact", count: 4096, prettyStream: false, nestedPayload: false},
+			{name: "synthetic_pretty_stream_nested", count: 1536, prettyStream: true, nestedPayload: true},
 		}
-		for _, item := range paths {
-			payload, err := os.ReadFile(item.path)
+		for _, profile := range profiles {
+			payload, err := buildSyntheticQueryRealworldPayload(profile.count, profile.prettyStream, profile.nestedPayload)
 			if err != nil {
-				queryRealworldErr = fmt.Errorf("read %s: %w", item.path, err)
+				queryRealworldErr = fmt.Errorf("build %s: %w", profile.name, err)
 				return
 			}
 			queryRealworldData = append(queryRealworldData, queryRealworldDataset{
-				name:    item.name,
+				name:    profile.name,
 				payload: payload,
 			})
 		}
@@ -155,4 +165,188 @@ func loadQueryRealworldDatasets() ([]queryRealworldDataset, error) {
 		return nil, queryRealworldErr
 	}
 	return queryRealworldData, nil
+}
+
+func buildSyntheticQueryRealworldPayload(count int, prettyStream, nestedPayload bool) ([]byte, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("invalid synthetic realworld count %d", count)
+	}
+	if prettyStream {
+		var buf bytes.Buffer
+		for i := 0; i < count; i++ {
+			doc := buildSyntheticQueryRealworldRecord(i, nestedPayload)
+			payload, err := json.MarshalIndent(doc, "", "  ")
+			if err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write(payload); err != nil {
+				return nil, err
+			}
+			buf.WriteByte('\n')
+		}
+		return buf.Bytes(), nil
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	for i := 0; i < count; i++ {
+		if err := enc.Encode(buildSyntheticQueryRealworldRecord(i, nestedPayload)); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+func buildSyntheticQueryRealworldRecord(i int, nestedPayload bool) map[string]any {
+	event := syntheticQueryRealworldEvent(i)
+	component := syntheticQueryRealworldComponent(i)
+	code := 3 + (i % 11)
+	activeIdx := i % 4
+	tabCount := 2 + (i % 4)
+	if event == querySyntheticEventSparseTarget {
+		activeIdx = 0
+		tabCount = 1
+		if code < 10 {
+			code = 10 + (i % 4)
+		}
+	}
+
+	hash := syntheticQueryRealworldHash(i)
+	sessionIDs := syntheticQueryRealworldSessionIDs(i)
+	if len(sessionIDs) == 0 && event == querySyntheticEventSparseTarget {
+		sessionIDs = []string{
+			fmt.Sprintf("sid-%04d-a", i),
+			fmt.Sprintf("sid-%04d-b", i),
+		}
+	}
+
+	record := map[string]any{
+		"event":      event,
+		"component":  component,
+		"code":       code,
+		"active_idx": activeIdx,
+		"tab_count":  tabCount,
+		"query": map[string]any{
+			"hash":        hash,
+			"latency_ms":  12 + (i % 180),
+			"fingerprint": fmt.Sprintf("fp-%04d", (i*17)%4096),
+		},
+		"payload":   syntheticQueryRealworldPayloadValue(i, nestedPayload),
+		"timestamp": fmt.Sprintf("2026-03-10T12:%02d:%02dZ", i%60, (i*7)%60),
+		"meta": map[string]any{
+			"zone":      [...]string{"eu-north", "us-east", "ap-south"}[i%3],
+			"build":     fmt.Sprintf("build-%03d", i%200),
+			"retryable": i%5 == 0,
+		},
+	}
+	if len(sessionIDs) > 0 {
+		record["session_ids"] = sessionIDs
+	}
+	return record
+}
+
+func syntheticQueryRealworldEvent(i int) string {
+	if i%61 == 0 {
+		return querySyntheticEventSparseTarget
+	}
+	return [...]string{"heartbeat", "cache_refresh", "ui_render", "snapshot_emit"}[i%4]
+}
+
+func syntheticQueryRealworldComponent(i int) string {
+	if i%5 != 0 {
+		return querySyntheticComponentDenseTarget
+	}
+	return [...]string{"worker", "ingest", "scheduler"}[i%3]
+}
+
+func syntheticQueryRealworldHash(i int) string {
+	if i%97 == 0 {
+		return querySyntheticHashSparseTarget
+	}
+	return fmt.Sprintf("%08x%08x%08x%08x%08x%08x%08x%08x",
+		i*17+3,
+		i*19+5,
+		i*23+7,
+		i*29+11,
+		i*31+13,
+		i*37+17,
+		i*41+19,
+		i*43+23,
+	)
+}
+
+func syntheticQueryRealworldSessionIDs(i int) []string {
+	switch {
+	case i%73 == 0:
+		return []string{
+			querySyntheticSessionIDSparseTarget,
+			fmt.Sprintf("sid-%04d-extra", i),
+		}
+	case i%2 == 0:
+		return []string{
+			fmt.Sprintf("sid-%04d-a", i),
+			fmt.Sprintf("sid-%04d-b", i),
+		}
+	default:
+		return nil
+	}
+}
+
+func syntheticQueryRealworldPayloadValue(i int, nested bool) any {
+	if !nested {
+		return map[string]any{
+			"blob":   syntheticQueryRealworldBlob(i, 96+(i%32)),
+			"status": [...]string{"ok", "warm", "cold"}[i%3],
+			"frames": []any{
+				map[string]any{"id": i % 8, "kind": "header"},
+				map[string]any{"id": (i + 3) % 8, "kind": "body"},
+			},
+			"lookup": map[string]any{
+				"active": i%2 == 0,
+				"score":  (i * 29) % 1000,
+			},
+		}
+	}
+	return []any{
+		map[string]any{
+			"kind": "segment",
+			"meta": map[string]any{
+				"label": fmt.Sprintf("seg-%03d", i%128),
+				"rank":  i % 9,
+			},
+			"blob": syntheticQueryRealworldBlob(i, 72+(i%24)),
+		},
+		map[string]any{
+			"kind": "summary",
+			"children": []any{
+				map[string]any{
+					"id":      fmt.Sprintf("child-%03d", i%64),
+					"enabled": i%3 != 0,
+				},
+				map[string]any{
+					"id":      fmt.Sprintf("child-%03d", (i+7)%64),
+					"enabled": i%4 != 0,
+				},
+			},
+			"notes": []string{
+				"synthetic",
+				"anonymous",
+				"shape-" + strconv.Itoa(i%11),
+			},
+		},
+	}
+}
+
+func syntheticQueryRealworldBlob(i, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(n)
+	alphabet := "abcdefghijklmnopqrstuvwxyz0123456789"
+	for j := 0; j < n; j++ {
+		b.WriteByte(alphabet[(i+j*7)%len(alphabet)])
+	}
+	return b.String()
 }
