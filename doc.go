@@ -106,10 +106,45 @@
 //
 //	/state{/owner="alice",/note="hi"}
 //
+// File-backed mutation values are supported only in streaming mutation paths.
+// They are disabled by default and require ParseMutationsWithOptions:
+//
+//	muts, _ := lql.ParseMutationsWithOptions([]string{`file:/payload=blob.bin`}, time.Now(), lql.ParseMutationsOptions{
+//	  EnableFileValues: true,
+//	  FileValueBaseDir: "/workdir",
+//	})
+//
+// Streaming mutation can also create a new JSON object from `{}` while loading
+// file content into a field:
+//
+//	muts, _ := lql.ParseMutationsWithOptions([]string{
+//	  `/filename=notes.txt`,
+//	  `/tags/kind=document`,
+//	  `/tags/source=local`,
+//	  `textfile:/content=notes.txt`,
+//	}, time.Now(), lql.ParseMutationsOptions{
+//	  EnableFileValues: true,
+//	  FileValueBaseDir: ".",
+//	})
+//	_ = lql.MutateStream(lql.MutateStreamRequest{
+//	  Reader: strings.NewReader(`{}`),
+//	  Writer: os.Stdout,
+//	  Mutations: muts,
+//	})
+//
 // Example:
 //
 //	doc := map[string]any{"state": map[string]any{"retries": 1}}
 //	_ = lql.Mutate(doc, "/state/retries=+2", "/state/status=running")
+//
+// Comma/newline separated mutation strings can also drive streaming mutation:
+//
+//	muts, _ := lql.ParseMutationsString("/filename=notes.txt,\n/tags/kind=document,\n/tags/source=local", time.Now())
+//	_ = lql.MutateStream(lql.MutateStreamRequest{
+//	  Reader: strings.NewReader(`{}`),
+//	  Writer: os.Stdout,
+//	  Mutations: muts,
+//	})
 //
 // The package is intentionally small and dependency-free so it can be embedded
 // in CLIs and services that need LQL parsing or evaluation.

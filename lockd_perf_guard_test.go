@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -133,6 +134,101 @@ func TestLockdPerfGuardMutateStreamPlan(t *testing.T) {
 	minThroughput := lockdPerfGuardFloatEnv("LQL_PERF_GUARD_MUTATE_MIN_MBPS", 12.0)
 	if throughput < minThroughput {
 		t.Fatalf("mutate throughput guard failed: %.2f MiB/s < %.2f MiB/s", throughput, minThroughput)
+	}
+}
+
+func TestLockdPerfGuardMutateStreamFileBackedTextPlan(t *testing.T) {
+	lockdPerfGuardMutateStreamFileBackedPlan(t,
+		"text",
+		`textfile:/payload=blob.txt`,
+		filepath.Join("/virtual", "blob.txt"),
+		bytes.Repeat([]byte("hello world\n"), 512),
+		60.0,
+	)
+}
+
+func TestLockdPerfGuardMutateStreamFileBackedBase64Plan(t *testing.T) {
+	lockdPerfGuardMutateStreamFileBackedPlan(t,
+		"base64",
+		`base64file:/payload=blob.bin`,
+		filepath.Join("/virtual", "blob.bin"),
+		bytes.Repeat([]byte{0x00, 0x01, 0x02, 0x03}, 2048),
+		45.0,
+	)
+}
+
+func lockdPerfGuardMutateStreamFileBackedPlan(t *testing.T, name string, expr string, path string, filePayload []byte, minThroughputDefault float64) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping perf guard in short mode")
+	}
+	resolver := &nonAllocMutateFileResolver{
+		payloads: map[string][]byte{
+			path: filePayload,
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{expr}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+	plan, err := NewMutateStreamPlan(muts)
+	if err != nil {
+		t.Fatalf("mutate plan: %v", err)
+	}
+	input := []byte(`{"payload":"old"}`)
+
+	var src bytes.Reader
+	reader := bufio.NewReaderSize(&src, 64*1024)
+	runAlloc := func() error {
+		src.Reset(input)
+		reader.Reset(&src)
+		_, runErr := MutateStreamWithResult(MutateStreamRequest{
+			Reader: reader,
+			Writer: io.Discard,
+			Plan:   plan,
+		})
+		return runErr
+	}
+	if err := runAlloc(); err != nil {
+		t.Fatalf("file-backed mutate warmup: %v", err)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		if runErr := runAlloc(); runErr != nil {
+			t.Fatalf("file-backed mutate run: %v", runErr)
+		}
+	})
+	maxAllocs := lockdPerfGuardFloatEnv("LQL_PERF_GUARD_MUTATE_FILE_"+strings.ToUpper(name)+"_MAX_ALLOCS", 1.0)
+	if allocs > maxAllocs {
+		t.Fatalf("%s file-backed mutate alloc guard failed: allocs/run=%.2f max=%.2f", name, allocs, maxAllocs)
+	}
+
+	runThroughput := func() error {
+		src.Reset(input)
+		reader.Reset(&src)
+		_, runErr := MutateStreamWithResult(MutateStreamRequest{
+			Reader: reader,
+			Writer: io.Discard,
+			Plan:   plan,
+		})
+		return runErr
+	}
+	loops := 200
+	start := time.Now()
+	for i := 0; i < loops; i++ {
+		if err := runThroughput(); err != nil {
+			t.Fatalf("file-backed mutate throughput run %d: %v", i, err)
+		}
+	}
+	elapsed := time.Since(start)
+	bytesPerRun := len(filePayload) + len(input)
+	throughput := (float64(bytesPerRun*loops) / (1024 * 1024)) / elapsed.Seconds()
+	minThroughput := lockdPerfGuardFloatEnv("LQL_PERF_GUARD_MUTATE_FILE_"+strings.ToUpper(name)+"_MIN_MBPS", minThroughputDefault)
+	if throughput < minThroughput {
+		t.Fatalf("%s file-backed mutate throughput guard failed: %.2f MiB/s < %.2f MiB/s", name, throughput, minThroughput)
 	}
 }
 

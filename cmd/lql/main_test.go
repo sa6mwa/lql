@@ -374,6 +374,79 @@ func TestRunMutationsStreamMultipleObjects(t *testing.T) {
 	}
 }
 
+func TestRunMutationsFileBackedMutationsRequireEnableFlag(t *testing.T) {
+	cfg := config{
+		mutations: stringList{`file:/payload=blob.txt`},
+		compact:   true,
+	}
+	err := runMutations(cfg, lql.Selector{}, nil, []string{"-"})
+	if err == nil || !strings.Contains(err.Error(), "file-backed mutations are disabled") {
+		t.Fatalf("expected file-backed mutations disabled error, got %v", err)
+	}
+}
+
+func TestRunMutationsFileBackedMutationsEnabled(t *testing.T) {
+	tempDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tempDir, "blob.txt"), []byte("hello from file"), 0o600); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+	inputPath := filepath.Join(tempDir, "input.json")
+	if err := os.WriteFile(inputPath, []byte(`{"id":"a"}`), 0o600); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	defer os.Chdir(origWD)
+
+	cfg := config{
+		mutations:           stringList{`textfile:/payload=blob.txt`},
+		compact:             true,
+		enableFileMutations: true,
+	}
+
+	origStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writePipe
+	err = runMutations(cfg, lql.Selector{}, nil, []string{inputPath})
+	writePipe.Close()
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("runMutations: %v", err)
+	}
+
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	values := decodeJSONValues(t, output)
+	doc := values[0].(map[string]any)
+	if doc["payload"] != "hello from file" {
+		t.Fatalf("unexpected file-backed payload: %#v", doc["payload"])
+	}
+}
+
+func TestPrintUsageIncludesFileMutationShortFlag(t *testing.T) {
+	var out bytes.Buffer
+	printUsage(&out)
+
+	usage := out.String()
+	if !strings.Contains(usage, "-F, --enable-file-mutations") {
+		t.Fatalf("expected usage to include -F shorthand, got %q", usage)
+	}
+	if !strings.Contains(usage, "printf '{}\\n' | lql -F \\") {
+		t.Fatalf("expected usage example to include -F shorthand, got %q", usage)
+	}
+}
+
 func TestRunMutationsFieldsEmptyOutput(t *testing.T) {
 	doc := `{"id":"a"}
 {"id":"b"}`

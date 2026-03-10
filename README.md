@@ -206,6 +206,51 @@ _ = lql.MutateWithTime(doc, time.Now(), `time:/state/updated=NOW`)
 Mutations support the same wildcard semantics as selectors; missing paths under
 wildcards are skipped.
 
+File-backed mutation values are available for streaming mutation paths via
+`ParseMutationsWithOptions` and the `file:`, `textfile:`, and `base64file:`
+prefixes. They are disabled by default, produce JSON string values, and are not
+supported by `ApplyMutations`.
+
+Create a new JSON document from `{}` while streaming file content into a field:
+
+```bash
+printf '{}\n' | lql -F \
+  -m '/filename=notes.txt' \
+  -m '/tags/kind=document' \
+  -m '/tags/source=local' \
+  -m 'textfile:/content=notes.txt'
+```
+
+Auto mode chooses escaped text for UTF-8 files without NUL bytes and base64 for
+binary-looking input:
+
+```bash
+printf '{}\n' | lql -F \
+  -m '/filename=photo.jpg' \
+  -m '/tags/media=image' \
+  -m 'file:/content=photo.jpg'
+```
+
+Library callers can do the same thing with `MutateStream`:
+
+```go
+muts, _ := lql.ParseMutationsWithOptions([]string{
+  `/filename=notes.txt`,
+  `/tags/kind=document`,
+  `/tags/source=local`,
+  `textfile:/content=notes.txt`,
+}, time.Now(), lql.ParseMutationsOptions{
+  EnableFileValues: true,
+  FileValueBaseDir: ".",
+})
+
+_ = lql.MutateStream(lql.MutateStreamRequest{
+  Reader: strings.NewReader(`{}`),
+  Writer: os.Stdout,
+  Mutations: muts,
+})
+```
+
 Stream mutations over large inputs without loading the whole stream:
 
 ```go
@@ -301,6 +346,10 @@ which objects are mutated (output still includes all objects, subject to `-f`).
 Use `-M`/`--matches-only` to keep selectors acting as output filters even when
 `-m` is provided. Output always contains the full (possibly mutated) object
 unless `-f` is used.
+
+Local file-backed mutation values are disabled by default in the CLI. Enable
+them with `-F` or `--enable-file-mutations` to use `file:/field=path`,
+`textfile:/field=path`, or `base64file:/field=path`.
 
 ### Selection examples
 

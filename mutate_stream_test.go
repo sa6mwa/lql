@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -169,6 +170,302 @@ func TestMutateStreamWriterOutput(t *testing.T) {
 	}
 	if values[0].(map[string]any)["status"] != "ready" || values[1].(map[string]any)["status"] != "ready" {
 		t.Fatalf("expected mutated status in writer output, got %#v", values)
+	}
+}
+
+func TestMutateStreamFileBackedTextCreatesMissingObjectPath(t *testing.T) {
+	resolver := &mutateTestFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "blob.txt"): []byte("hello\n\"quoted\""),
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/meta/blob=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"id":"a"}`)),
+		Writer:    &out,
+		Mutations: muts,
+	})
+	if err != nil {
+		t.Fatalf("mutate stream: %v", err)
+	}
+	values := decodeJSONValuesForMutateTest(t, out.Bytes())
+	doc := values[0].(map[string]any)
+	meta := doc["meta"].(map[string]any)
+	if meta["blob"] != "hello\n\"quoted\"" {
+		t.Fatalf("unexpected text payload: %#v", meta["blob"])
+	}
+	if got := resolver.opens[filepath.Join("/virtual", "blob.txt")]; got != 1 {
+		t.Fatalf("expected one open for explicit text mode, got %d", got)
+	}
+}
+
+func TestMutateStreamFileBackedBase64WritesStringValue(t *testing.T) {
+	resolver := &mutateTestFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "blob.bin"): {0x00, 0x01, 0x02, 'a'},
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{`base64file:/payload=blob.bin`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"id":"a","payload":"old"}`)),
+		Writer:    &out,
+		Mutations: muts,
+	})
+	if err != nil {
+		t.Fatalf("mutate stream: %v", err)
+	}
+	values := decodeJSONValuesForMutateTest(t, out.Bytes())
+	doc := values[0].(map[string]any)
+	if doc["payload"] != "AAECYQ==" {
+		t.Fatalf("unexpected base64 payload: %#v", doc["payload"])
+	}
+	if got := resolver.opens[filepath.Join("/virtual", "blob.bin")]; got != 1 {
+		t.Fatalf("expected one open for explicit base64 mode, got %d", got)
+	}
+}
+
+func TestMutateStreamFileBackedAutoModeSweepsThenRestreams(t *testing.T) {
+	resolver := &mutateTestFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "text.txt"): []byte("hello world"),
+			filepath.Join("/virtual", "blob.bin"): {0x00, 0xff, 0x01},
+		},
+	}
+	textMuts, err := ParseMutationsWithOptions([]string{`file:/payload=text.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse text file-backed mutations: %v", err)
+	}
+	binMuts, err := ParseMutationsWithOptions([]string{`file:/payload=blob.bin`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse binary file-backed mutations: %v", err)
+	}
+
+	var textOut bytes.Buffer
+	if err := MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    &textOut,
+		Mutations: textMuts,
+	}); err != nil {
+		t.Fatalf("mutate stream auto text: %v", err)
+	}
+	var binOut bytes.Buffer
+	if err := MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    &binOut,
+		Mutations: binMuts,
+	}); err != nil {
+		t.Fatalf("mutate stream auto binary: %v", err)
+	}
+
+	textDoc := decodeJSONValuesForMutateTest(t, textOut.Bytes())[0].(map[string]any)
+	if textDoc["payload"] != "hello world" {
+		t.Fatalf("unexpected auto text payload: %#v", textDoc["payload"])
+	}
+	binDoc := decodeJSONValuesForMutateTest(t, binOut.Bytes())[0].(map[string]any)
+	if binDoc["payload"] != "AP8B" {
+		t.Fatalf("unexpected auto binary payload: %#v", binDoc["payload"])
+	}
+	if got := resolver.opens[filepath.Join("/virtual", "text.txt")]; got != 2 {
+		t.Fatalf("expected two opens for auto text mode, got %d", got)
+	}
+	if got := resolver.opens[filepath.Join("/virtual", "blob.bin")]; got != 2 {
+		t.Fatalf("expected two opens for auto binary mode, got %d", got)
+	}
+}
+
+func TestMutateStreamFileBackedPlanMatchesMutations(t *testing.T) {
+	resolver := &mutateTestFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "blob.txt"): []byte("plan payload"),
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+	plan, err := NewMutateStreamPlan(muts)
+	if err != nil {
+		t.Fatalf("new mutate plan: %v", err)
+	}
+
+	input := []byte(`{"id":"a","payload":"old"}`)
+	var outMutations bytes.Buffer
+	if err := MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader(input),
+		Writer:    &outMutations,
+		Mutations: muts,
+	}); err != nil {
+		t.Fatalf("mutate stream with mutations: %v", err)
+	}
+	var outPlan bytes.Buffer
+	if err := MutateStream(MutateStreamRequest{
+		Reader: bytes.NewReader(input),
+		Writer: &outPlan,
+		Plan:   plan,
+	}); err != nil {
+		t.Fatalf("mutate stream with plan: %v", err)
+	}
+
+	gotMutations := decodeJSONValuesForMutateTest(t, outMutations.Bytes())
+	gotPlan := decodeJSONValuesForMutateTest(t, outPlan.Bytes())
+	if !reflect.DeepEqual(gotMutations, gotPlan) {
+		t.Fatalf("file-backed mutate plan parity mismatch:\nmutations=%#v\nplan=%#v", gotMutations, gotPlan)
+	}
+}
+
+func TestMutateStreamFileBackedResolverOpenErrorPropagates(t *testing.T) {
+	sentinel := errors.New("open failed")
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: failingMutateFileResolver{err: sentinel},
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    io.Discard,
+		Mutations: muts,
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected open sentinel, got %v", err)
+	}
+}
+
+func TestMutateStreamFileBackedReadErrorPropagates(t *testing.T) {
+	sentinel := errors.New("read failed")
+	resolver := &failingReadMutateFileResolver{
+		payload: []byte("hello"),
+		err:     sentinel,
+	}
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    io.Discard,
+		Mutations: muts,
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected read sentinel, got %v", err)
+	}
+}
+
+func TestMutateStreamTextFileRejectsInvalidUTF8(t *testing.T) {
+	resolver := &nonAllocMutateFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "blob.txt"): {0xff, 0xfe},
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    io.Discard,
+		Mutations: muts,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("expected invalid UTF-8 error, got %v", err)
+	}
+}
+
+func TestMutateStreamTextFileRejectsNUL(t *testing.T) {
+	resolver := &nonAllocMutateFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "blob.txt"): {'a', 0x00, 'b'},
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    io.Discard,
+		Mutations: muts,
+	})
+	if err == nil || !strings.Contains(err.Error(), "NUL byte") {
+		t.Fatalf("expected NUL byte error, got %v", err)
+	}
+}
+
+func TestMutateStreamFileBackedThenChildMutationCreatesObject(t *testing.T) {
+	resolver := &nonAllocMutateFileResolver{
+		payloads: map[string][]byte{
+			filepath.Join("/virtual", "blob.txt"): []byte("hello"),
+		},
+	}
+	muts, err := ParseMutationsWithOptions([]string{
+		`textfile:/payload=blob.txt`,
+		`/payload/version=1`,
+	}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues:  true,
+		FileValueBaseDir:  "/virtual",
+		FileValueResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("parse file-backed mutations: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = MutateStream(MutateStreamRequest{
+		Reader:    bytes.NewReader([]byte(`{"payload":"old"}`)),
+		Writer:    &out,
+		Mutations: muts,
+	})
+	if err != nil {
+		t.Fatalf("mutate stream: %v", err)
+	}
+	doc := decodeJSONValuesForMutateTest(t, out.Bytes())[0].(map[string]any)
+	payload := doc["payload"].(map[string]any)
+	if payload["version"] != json.Number("1") {
+		t.Fatalf("expected child mutation to replace file-backed leaf with object, got %#v", doc["payload"])
 	}
 }
 
@@ -797,4 +1094,21 @@ func decodeNDJSONValues(payload []byte) ([]any, error) {
 		}
 		values = append(values, value)
 	}
+}
+
+type mutateTestFileResolver struct {
+	payloads map[string][]byte
+	opens    map[string]int
+}
+
+func (r *mutateTestFileResolver) Open(path string) (io.ReadCloser, error) {
+	if r.opens == nil {
+		r.opens = make(map[string]int)
+	}
+	payload, ok := r.payloads[path]
+	if !ok {
+		return nil, fmt.Errorf("unknown test payload %q", path)
+	}
+	r.opens[path]++
+	return io.NopCloser(bytes.NewReader(payload)), nil
 }

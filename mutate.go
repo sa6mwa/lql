@@ -3,7 +3,10 @@ package lql
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +30,52 @@ type Mutation struct {
 	Kind  MutationKind
 	Value any
 	Delta float64
+
+	fileValue *mutationFileValue
+}
+
+type mutationFileValueMode uint8
+
+const (
+	mutationFileValueModeAuto mutationFileValueMode = iota
+	mutationFileValueModeText
+	mutationFileValueModeBase64
+)
+
+type mutationFileValue struct {
+	path     string
+	mode     mutationFileValueMode
+	resolver MutationFileValueResolver
+}
+
+func (v *mutationFileValue) open() (io.ReadCloser, error) {
+	if v == nil {
+		return nil, fmt.Errorf("file-backed mutation value is nil")
+	}
+	if v.resolver != nil {
+		return v.resolver.Open(v.path)
+	}
+	return os.Open(v.path)
+}
+
+func (m Mutation) hasFileValue() bool {
+	return m.fileValue != nil
+}
+
+// MutationFileValueResolver opens file-backed mutation sources.
+//
+// Implementations must return a new reader positioned at offset 0 on each Open
+// call. Auto mode may open the same path more than once per mutation
+// application.
+type MutationFileValueResolver interface {
+	Open(path string) (io.ReadCloser, error)
+}
+
+// ParseMutationsOptions configures ParseMutationsWithOptions behavior.
+type ParseMutationsOptions struct {
+	EnableFileValues  bool
+	FileValueBaseDir  string
+	FileValueResolver MutationFileValueResolver
 }
 
 // ParseMutations parses CLI-style mutation expressions into Mutation structs.
@@ -34,6 +83,12 @@ type Mutation struct {
 // keys require no extra quoting. Brace shorthand (`/foo{/bar=1,/baz=2}`),
 // rm:/time: prefixes, and ++/--/+=/-= increment forms are supported.
 func ParseMutations(exprs []string, now time.Time) ([]Mutation, error) {
+	return ParseMutationsWithOptions(exprs, now, ParseMutationsOptions{})
+}
+
+// ParseMutationsWithOptions parses CLI-style mutation expressions into Mutation
+// structs using the supplied parser options.
+func ParseMutationsWithOptions(exprs []string, now time.Time, opts ParseMutationsOptions) ([]Mutation, error) {
 	if len(exprs) == 0 {
 		return nil, fmt.Errorf("no field mutations provided")
 	}
@@ -43,7 +98,7 @@ func ParseMutations(exprs []string, now time.Time) ([]Mutation, error) {
 		if expr == "" {
 			continue
 		}
-		muts, err := parseMutationExpr(expr, now)
+		muts, err := parseMutationExpr(expr, now, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -101,8 +156,23 @@ func MutateWithTime(doc map[string]any, now time.Time, exprs ...string) error {
 	return ApplyMutations(doc, muts)
 }
 
-func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
+func parseMutationExpr(expr string, now time.Time, opts ParseMutationsOptions) ([]Mutation, error) {
 	removeMode := false
+	fileMode := mutationFileValueModeAuto
+	fileModeSet := false
+	switch {
+	case strings.HasPrefix(expr, "file:"):
+		fileModeSet = true
+		expr = strings.TrimPrefix(expr, "file:")
+	case strings.HasPrefix(expr, "textfile:"):
+		fileModeSet = true
+		fileMode = mutationFileValueModeText
+		expr = strings.TrimPrefix(expr, "textfile:")
+	case strings.HasPrefix(expr, "base64file:"):
+		fileModeSet = true
+		fileMode = mutationFileValueModeBase64
+		expr = strings.TrimPrefix(expr, "base64file:")
+	}
 	switch {
 	case strings.HasPrefix(expr, "rm:"):
 		removeMode = true
@@ -119,6 +189,9 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 	}
 	timeMode := false
 	if strings.HasPrefix(expr, "time:") {
+		if fileModeSet {
+			return nil, fmt.Errorf("file-backed mutation cannot be combined with time: (%s)", expr)
+		}
 		if removeMode {
 			return nil, fmt.Errorf("time-prefixed mutation cannot be combined with delete/remove (%s)", expr)
 		}
@@ -126,6 +199,9 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 		expr = strings.TrimPrefix(expr, "time:")
 	}
 	if removeMode {
+		if fileModeSet {
+			return nil, fmt.Errorf("file-backed mutation cannot be combined with delete/remove (%s)", expr)
+		}
 		path := strings.TrimSpace(expr)
 		if path == "" {
 			return nil, fmt.Errorf("remove mutation missing key path")
@@ -137,6 +213,9 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 		return []Mutation{{Path: pathParts, Kind: MutationRemove}}, nil
 	}
 	if strings.HasSuffix(expr, "++") {
+		if fileModeSet {
+			return nil, fmt.Errorf("file-backed mutation cannot be combined with ++ (%s)", expr)
+		}
 		if timeMode {
 			return nil, fmt.Errorf("time-prefixed mutation does not support ++ (%s)", expr)
 		}
@@ -148,6 +227,9 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 		return []Mutation{mut}, nil
 	}
 	if strings.HasSuffix(expr, "--") {
+		if fileModeSet {
+			return nil, fmt.Errorf("file-backed mutation cannot be combined with -- (%s)", expr)
+		}
 		if timeMode {
 			return nil, fmt.Errorf("time-prefixed mutation does not support -- (%s)", expr)
 		}
@@ -181,7 +263,7 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 					if sub == "" {
 						continue
 					}
-					subMuts, err := parseMutationExpr(sub, now)
+					subMuts, err := parseMutationExpr(sub, now, opts)
 					if err != nil {
 						return nil, err
 					}
@@ -207,6 +289,16 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 	}
 	value := strings.TrimSpace(parts[1])
 	if !timeMode {
+		if fileModeSet {
+			if !opts.EnableFileValues {
+				return nil, fmt.Errorf("file-backed mutations are disabled")
+			}
+			mut, err := buildFileSetMutation(path, value, fileMode, opts)
+			if err != nil {
+				return nil, err
+			}
+			return []Mutation{mut}, nil
+		}
 		if len(value) > 0 && (value[0] == '+' || value[0] == '-') {
 			if delta, err := strconv.ParseFloat(value, 64); err == nil {
 				mut, err := buildIncrementMutation(path, delta)
@@ -222,6 +314,45 @@ func parseMutationExpr(expr string, now time.Time) ([]Mutation, error) {
 		return nil, err
 	}
 	return []Mutation{mut}, nil
+}
+
+func buildFileSetMutation(path string, filePath string, mode mutationFileValueMode, opts ParseMutationsOptions) (Mutation, error) {
+	pathSegments, err := splitPath(path)
+	if err != nil {
+		return Mutation{}, err
+	}
+	resolvedPath, err := resolveMutationFilePath(filePath, opts.FileValueBaseDir)
+	if err != nil {
+		return Mutation{}, err
+	}
+	return Mutation{
+		Path: pathSegments,
+		Kind: MutationSet,
+		fileValue: &mutationFileValue{
+			path:     resolvedPath,
+			mode:     mode,
+			resolver: opts.FileValueResolver,
+		},
+	}, nil
+}
+
+func resolveMutationFilePath(path string, baseDir string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("file-backed mutation missing file path")
+	}
+	if strings.HasPrefix(path, `"`) && strings.HasSuffix(path, `"`) && len(path) >= 2 {
+		path = path[1 : len(path)-1]
+	} else if strings.HasPrefix(path, `'`) && strings.HasSuffix(path, `'`) && len(path) >= 2 {
+		path = path[1 : len(path)-1]
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	if baseDir == "" {
+		return "", fmt.Errorf("relative file-backed mutation path %q requires file value base dir", path)
+	}
+	return filepath.Clean(filepath.Join(baseDir, path)), nil
 }
 
 func buildSetMutation(path string, literal string, timeMode bool, now time.Time) (Mutation, error) {
@@ -310,6 +441,9 @@ func ApplyMutations(doc map[string]any, muts []Mutation) error {
 		return fmt.Errorf("document must be an object")
 	}
 	for _, mut := range muts {
+		if mut.hasFileValue() {
+			return fmt.Errorf("file-backed mutation at /%s requires MutateStream", strings.Join(mut.Path, "/"))
+		}
 		if err := applyMutation(doc, mut); err != nil {
 			return err
 		}

@@ -32,12 +32,13 @@ func (s *stringList) Type() string {
 }
 
 type config struct {
-	mutations   stringList
-	fields      stringList
-	inline      bool
-	compact     bool
-	theme       string
-	matchesOnly bool
+	mutations           stringList
+	fields              stringList
+	inline              bool
+	compact             bool
+	theme               string
+	matchesOnly         bool
+	enableFileMutations bool
 }
 
 func main() {
@@ -63,6 +64,7 @@ func main() {
 	flags.BoolVarP(&showVersion, "version", "v", false, "show version")
 	flags.BoolVarP(&orMode, "or", "O", false, "combine selector arguments with OR")
 	flags.BoolVarP(&cfg.matchesOnly, "matches-only", "M", false, "output only selector matches (even with -m)")
+	flags.BoolVarP(&cfg.enableFileMutations, "enable-file-mutations", "F", false, "allow file:/textfile:/base64file: mutation values")
 	flags.Usage = func() {}
 
 	if err := flags.Parse(os.Args[1:]); err != nil {
@@ -169,7 +171,7 @@ func runSelections(cfg config, selector lql.Selector, fields []fieldPath, inputP
 }
 
 func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPaths []string) error {
-	muts, err := lql.ParseMutations(cfg.mutations, time.Now())
+	muts, err := parseConfiguredMutations(cfg)
 	if err != nil {
 		return err
 	}
@@ -200,6 +202,20 @@ func runMutations(cfg config, selector lql.Selector, fields []fieldPath, inputPa
 		return fmt.Errorf("no JSON input")
 	}
 	return nil
+}
+
+func parseConfiguredMutations(cfg config) ([]lql.Mutation, error) {
+	if !cfg.enableFileMutations {
+		return lql.ParseMutations(cfg.mutations, time.Now())
+	}
+	baseDir, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	return lql.ParseMutationsWithOptions(cfg.mutations, time.Now(), lql.ParseMutationsOptions{
+		EnableFileValues: true,
+		FileValueBaseDir: baseDir,
+	})
 }
 
 type streamStats struct {
@@ -607,6 +623,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -m, --mutate expr    Apply mutations to each JSON object in the input stream.")
 	fmt.Fprintln(w, "  -i, --inline         Write mutation output inline to a single input file.")
 	fmt.Fprintln(w, "  -w, --write          Alias of --inline.")
+	fmt.Fprintln(w, "  -F, --enable-file-mutations")
+	fmt.Fprintln(w, "                       Allow file:/textfile:/base64file: mutation values.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Output:")
 	fmt.Fprintln(w, "  -f, --field /path    Output only the selected JSON Pointer fields (repeatable).")
@@ -656,6 +674,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Note: only date{...,since=...} supports relative macros (now, today, yesterday).")
 	fmt.Fprintln(w, "Note: omitted values for contains/icontains/prefix/iprefix act as path assertions.")
 	fmt.Fprintln(w, "Note: mutations apply to a JSON object root, but paths may traverse arrays.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "File-backed mutation example:")
+	fmt.Fprintln(w, "  printf '{}\\n' | lql -F \\")
+	fmt.Fprintln(w, "    -m '/filename=notes.txt' -m '/tags/kind=document' \\")
+	fmt.Fprintln(w, "    -m '/tags/source=local' -m 'textfile:/content=notes.txt'")
 }
 
 func buildSelector(args []string, orMode bool) (lql.Selector, error) {

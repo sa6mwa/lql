@@ -2,6 +2,8 @@ package lql
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +122,79 @@ func TestParseMutationsBraceAndPointer(t *testing.T) {
 		t.Fatalf("expected RFC3339 timestamp, got %v", muts[5].Value)
 	}
 	assertMutation(t, muts[6], MutationRemove, []string{"state", "legacy"})
+}
+
+func TestParseMutationsRejectsFileBackedByDefault(t *testing.T) {
+	_, err := ParseMutations([]string{`file:/payload=blob.txt`}, time.Unix(1_700_000_000, 0))
+	if err == nil || !strings.Contains(err.Error(), "file-backed mutations are disabled") {
+		t.Fatalf("expected file-backed mutation disabled error, got %v", err)
+	}
+}
+
+func TestParseMutationsWithOptionsParsesFileBackedMutation(t *testing.T) {
+	tempDir := t.TempDir()
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues: true,
+		FileValueBaseDir: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("ParseMutationsWithOptions: %v", err)
+	}
+	if len(muts) != 1 {
+		t.Fatalf("expected one mutation, got %d", len(muts))
+	}
+	if !muts[0].hasFileValue() {
+		t.Fatalf("expected file-backed mutation")
+	}
+	if got, want := muts[0].fileValue.path, filepath.Join(tempDir, "blob.txt"); got != want {
+		t.Fatalf("unexpected resolved path got=%q want=%q", got, want)
+	}
+}
+
+func TestApplyMutationsRejectsFileBackedMutation(t *testing.T) {
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "blob.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	muts, err := ParseMutationsWithOptions([]string{`file:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues: true,
+		FileValueBaseDir: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("ParseMutationsWithOptions: %v", err)
+	}
+	err = ApplyMutations(map[string]any{}, muts)
+	if err == nil || !strings.Contains(err.Error(), "requires MutateStream") {
+		t.Fatalf("expected MutateStream-only error, got %v", err)
+	}
+}
+
+func TestParseMutationsWithOptionsRejectsRelativeFilePathWithoutBaseDir(t *testing.T) {
+	_, err := ParseMutationsWithOptions([]string{`file:/payload=blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires file value base dir") {
+		t.Fatalf("expected relative path base dir error, got %v", err)
+	}
+}
+
+func TestParseMutationsWithOptionsRejectsInvalidFileBackedCombinations(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cases := []string{
+		`file:/payload++`,
+		`file:rm:/payload=blob.txt`,
+		`file:time:/payload=blob.txt`,
+	}
+	for _, expr := range cases {
+		_, err := ParseMutationsWithOptions([]string{expr}, now, ParseMutationsOptions{
+			EnableFileValues: true,
+			FileValueBaseDir: "/virtual",
+		})
+		if err == nil {
+			t.Fatalf("expected invalid file-backed combination error for %q", expr)
+		}
+	}
 }
 
 func TestMutationsHelper(t *testing.T) {

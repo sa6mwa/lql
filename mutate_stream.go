@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -321,10 +322,10 @@ func releaseMutateStreamState(state *mutateStreamState) {
 	state.stopRequested = false
 	for i := range state.missingCache {
 		state.missingCache[i].rules = state.missingCache[i].rules[:0]
-		state.missingCache[i].payload = state.missingCache[i].payload[:0]
+		state.missingCache[i].root = nil
 		for j := range state.missingCache[i].members {
 			state.missingCache[i].members[j].key = ""
-			state.missingCache[i].members[j].payload = state.missingCache[i].members[j].payload[:0]
+			state.missingCache[i].members[j].value = nil
 		}
 		state.missingCache[i].members = state.missingCache[i].members[:0]
 		state.missingCache[i].hasValue = false
@@ -344,6 +345,7 @@ type mutateStreamState struct {
 	readerStorage    streamByteReader
 	bufferedReader   *bufio.Reader
 	payloadReader    *bufio.Reader
+	fileReader       *bufio.Reader
 	payloadSrc       bytes.Reader
 	payloadReaderBuf streamByteReader
 	onValue          func(MutateStreamValue) error
@@ -362,6 +364,8 @@ type mutateStreamState struct {
 	stringBuf     []byte
 	numberBuf     []byte
 	scratchBuf    []byte
+	fileReadBuf   []byte
+	base64Buf     []byte
 	valueHint     int
 	candidateHint int
 	path          []streamPathSegment
@@ -380,15 +384,34 @@ type mutateStreamState struct {
 }
 
 type mutateMissingMember struct {
-	key     string
-	payload []byte
+	key   string
+	value *mutateMissingNode
 }
 
 type mutateMissingCacheEntry struct {
 	rules    []mutateActiveRule
-	payload  []byte
+	root     *mutateMissingNode
 	members  []mutateMissingMember
 	hasValue bool
+}
+
+type mutateMissingNodeKind uint8
+
+const (
+	mutateMissingNodeObject mutateMissingNodeKind = iota
+	mutateMissingNodeLiteral
+	mutateMissingNodeFile
+)
+
+type mutateMissingNode struct {
+	kind    mutateMissingNodeKind
+	literal []byte
+	file    *mutationFileValue
+	members []mutateMissingMember
+}
+
+type mutateMissingFileMarker struct {
+	file *mutationFileValue
 }
 
 func (s *mutateStreamState) reset(req MutateStreamRequest) {
@@ -419,10 +442,10 @@ func (s *mutateStreamState) reset(req MutateStreamRequest) {
 	s.stopRequested = false
 	for i := range s.missingCache {
 		s.missingCache[i].rules = s.missingCache[i].rules[:0]
-		s.missingCache[i].payload = s.missingCache[i].payload[:0]
+		s.missingCache[i].root = nil
 		for j := range s.missingCache[i].members {
 			s.missingCache[i].members[j].key = ""
-			s.missingCache[i].members[j].payload = s.missingCache[i].members[j].payload[:0]
+			s.missingCache[i].members[j].value = nil
 		}
 		s.missingCache[i].members = s.missingCache[i].members[:0]
 		s.missingCache[i].hasValue = false
@@ -472,7 +495,7 @@ func (s *mutateStreamState) compileMutationProgram(muts []Mutation) error {
 			tokens:   tokens,
 			wildcard: pathHasWildcard(mut.Path),
 		}
-		if mut.Kind == MutationSet {
+		if mut.Kind == MutationSet && !mut.hasFileValue() {
 			payload, err := json.Marshal(mut.Value)
 			if err != nil {
 				return err
@@ -748,14 +771,22 @@ func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, ou
 					}
 					state.kind = mutateValueStateRemoved
 					state.payload = nil
+					state.fileValue = nil
 				} else if state.kind == mutateValueStateSource {
 					if err := s.skipValue(state.start); err != nil {
 						return err
 					}
 				}
 				pending = pending[:0]
-				state.kind = mutateValueStatePayload
-				state.payload = compiled.setJSON
+				if compiled.mut.hasFileValue() {
+					state.kind = mutateValueStateFile
+					state.payload = nil
+					state.fileValue = compiled.mut.fileValue
+				} else {
+					state.kind = mutateValueStatePayload
+					state.payload = compiled.setJSON
+					state.fileValue = nil
+				}
 			case MutationRemove:
 				if len(pending) > 0 {
 					if err := s.validatePendingState(state, pending); err != nil {
@@ -763,6 +794,7 @@ func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, ou
 					}
 					state.kind = mutateValueStateRemoved
 					state.payload = nil
+					state.fileValue = nil
 				} else if state.kind == mutateValueStateSource {
 					if err := s.skipValue(state.start); err != nil {
 						return err
@@ -771,6 +803,7 @@ func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, ou
 				pending = pending[:0]
 				state.kind = mutateValueStateRemoved
 				state.payload = nil
+				state.fileValue = nil
 			case MutationIncrement:
 				var err error
 				state, err = s.materializePendingState(state, pending)
@@ -833,6 +866,8 @@ func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, ou
 	switch state.kind {
 	case mutateValueStateRemoved:
 		return s.emitMissingValue(pending, out)
+	case mutateValueStateFile:
+		return s.mutateFileValue(state.fileValue, pending, out)
 	case mutateValueStatePayload:
 		return s.mutatePayloadValue(state.payload, pending, out)
 	case mutateValueStateNumber:
@@ -853,12 +888,13 @@ func (s *mutateStreamState) mutateValue(start byte, rules []mutateActiveRule, ou
 }
 
 type mutateNodeState struct {
-	kind     mutateValueState
-	start    byte
-	payload  []byte
-	isInt    bool
-	intVal   int64
-	floatVal float64
+	kind      mutateValueState
+	start     byte
+	payload   []byte
+	fileValue *mutationFileValue
+	isInt     bool
+	intVal    int64
+	floatVal  float64
 }
 
 type mutateValueState uint8
@@ -866,6 +902,7 @@ type mutateValueState uint8
 const (
 	mutateValueStateSource mutateValueState = iota
 	mutateValueStatePayload
+	mutateValueStateFile
 	mutateValueStateRemoved
 	mutateValueStateNumber
 )
@@ -904,6 +941,8 @@ func (s *mutateStreamState) applyPendingState(state mutateNodeState, pending []m
 	switch state.kind {
 	case mutateValueStateRemoved:
 		return s.emitMissingValue(pending, out)
+	case mutateValueStateFile:
+		return s.mutateFileValue(state.fileValue, pending, out)
 	case mutateValueStatePayload:
 		return s.mutatePayloadValue(state.payload, pending, out)
 	case mutateValueStateNumber:
@@ -923,6 +962,8 @@ func (s *mutateStreamState) applyPendingState(state mutateNodeState, pending []m
 
 func (s *mutateStreamState) writeNodeState(state mutateNodeState, out mutateByteWriter) error {
 	switch state.kind {
+	case mutateValueStateFile:
+		return s.emitFileMutationValue(state.fileValue, out)
 	case mutateValueStatePayload:
 		_, err := out.Write(state.payload)
 		return err
@@ -1003,6 +1044,190 @@ func (s *mutateStreamState) mutatePayloadValue(payload []byte, rules []mutateAct
 		return err
 	}
 	return io.ErrUnexpectedEOF
+}
+
+func (s *mutateStreamState) mutateFileValue(value *mutationFileValue, rules []mutateActiveRule, out mutateByteWriter) error {
+	if len(rules) == 0 {
+		return s.emitFileMutationValue(value, out)
+	}
+	if hasCreateNonWildcardRule(s.compiled, rules) {
+		return s.emitMissingValue(rules, out)
+	}
+	return s.emitFileMutationValue(value, out)
+}
+
+func (s *mutateStreamState) emitFileMutationValue(value *mutationFileValue, out mutateByteWriter) error {
+	if value == nil {
+		return fmt.Errorf("file-backed mutation value is nil")
+	}
+	mode := value.mode
+	if mode == mutationFileValueModeAuto {
+		textlike, err := s.inspectFileMutationTextlike(value)
+		if err != nil {
+			return err
+		}
+		if textlike {
+			mode = mutationFileValueModeText
+		} else {
+			mode = mutationFileValueModeBase64
+		}
+	}
+	switch mode {
+	case mutationFileValueModeText:
+		return s.emitTextFileMutationValue(value, out)
+	case mutationFileValueModeBase64:
+		return s.emitBase64FileMutationValue(value, out)
+	default:
+		return fmt.Errorf("unknown file-backed mutation mode")
+	}
+}
+
+func (s *mutateStreamState) inspectFileMutationTextlike(value *mutationFileValue) (bool, error) {
+	rc, err := value.open()
+	if err != nil {
+		return false, err
+	}
+	defer rc.Close()
+
+	reader := s.fileMutationReader(rc)
+	for {
+		r, size, err := reader.ReadRune()
+		if err == io.EOF {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if r == 0 {
+			return false, nil
+		}
+		if r == utf8.RuneError && size == 1 {
+			return false, nil
+		}
+	}
+}
+
+func (s *mutateStreamState) emitTextFileMutationValue(value *mutationFileValue, out mutateByteWriter) error {
+	rc, err := value.open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	if err := out.WriteByte('"'); err != nil {
+		return err
+	}
+	reader := s.fileMutationReader(rc)
+	for {
+		r, size, err := reader.ReadRune()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if r == 0 {
+			return fmt.Errorf("file-backed text mutation %q contains NUL byte", value.path)
+		}
+		if r == utf8.RuneError && size == 1 {
+			return fmt.Errorf("file-backed text mutation %q contains invalid UTF-8", value.path)
+		}
+		s.scratchBuf = s.scratchBuf[:0]
+		switch r {
+		case '"', '\\':
+			s.scratchBuf = append(s.scratchBuf, '\\', byte(r))
+		case '\b':
+			s.scratchBuf = append(s.scratchBuf, '\\', 'b')
+		case '\f':
+			s.scratchBuf = append(s.scratchBuf, '\\', 'f')
+		case '\n':
+			s.scratchBuf = append(s.scratchBuf, '\\', 'n')
+		case '\r':
+			s.scratchBuf = append(s.scratchBuf, '\\', 'r')
+		case '\t':
+			s.scratchBuf = append(s.scratchBuf, '\\', 't')
+		default:
+			if r < 0x20 || r == '\u2028' || r == '\u2029' {
+				s.scratchBuf = appendUnicodeEscape(s.scratchBuf, r)
+			} else {
+				s.scratchBuf = utf8.AppendRune(s.scratchBuf, r)
+			}
+		}
+		if _, err := out.Write(s.scratchBuf); err != nil {
+			return err
+		}
+	}
+	return out.WriteByte('"')
+}
+
+func (s *mutateStreamState) emitBase64FileMutationValue(value *mutationFileValue, out mutateByteWriter) error {
+	rc, err := value.open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	if err := out.WriteByte('"'); err != nil {
+		return err
+	}
+	readBuf, encodeBuf := s.fileMutationBase64Buffers()
+	carryLen := 0
+	for {
+		n, readErr := rc.Read(readBuf[carryLen:cap(readBuf)])
+		if n > 0 {
+			total := carryLen + n
+			encodeLen := total - (total % 3)
+			if encodeLen > 0 {
+				encodedLen := base64.StdEncoding.EncodedLen(encodeLen)
+				base64.StdEncoding.Encode(encodeBuf[:encodedLen], readBuf[:encodeLen])
+				if _, err := out.Write(encodeBuf[:encodedLen]); err != nil {
+					return err
+				}
+			}
+			carryLen = total - encodeLen
+			if carryLen > 0 {
+				copy(readBuf[:carryLen], readBuf[encodeLen:total])
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	if carryLen > 0 {
+		encodedLen := base64.StdEncoding.EncodedLen(carryLen)
+		base64.StdEncoding.Encode(encodeBuf[:encodedLen], readBuf[:carryLen])
+		if _, err := out.Write(encodeBuf[:encodedLen]); err != nil {
+			return err
+		}
+	}
+	return out.WriteByte('"')
+}
+
+func (s *mutateStreamState) fileMutationReader(r io.Reader) *bufio.Reader {
+	if s.fileReader == nil {
+		s.fileReader = bufio.NewReaderSize(r, 64*1024)
+		return s.fileReader
+	}
+	s.fileReader.Reset(r)
+	return s.fileReader
+}
+
+func (s *mutateStreamState) fileMutationBase64Buffers() ([]byte, []byte) {
+	if cap(s.fileReadBuf) < 64*1024+2 {
+		s.fileReadBuf = make([]byte, 64*1024+2)
+	} else {
+		s.fileReadBuf = s.fileReadBuf[:64*1024+2]
+	}
+	needEncoded := base64.StdEncoding.EncodedLen(cap(s.fileReadBuf))
+	if cap(s.base64Buf) < needEncoded {
+		s.base64Buf = make([]byte, needEncoded)
+	} else {
+		s.base64Buf = s.base64Buf[:needEncoded]
+	}
+	return s.fileReadBuf, s.base64Buf
 }
 
 func (s *mutateStreamState) mutateObjectValue(rules []mutateActiveRule, out mutateByteWriter) error {
@@ -1173,7 +1398,7 @@ func (s *mutateStreamState) appendMissingObjectMembers(rules []mutateActiveRule,
 		if err := out.WriteByte(':'); err != nil {
 			return err
 		}
-		if _, err := out.Write(member.payload); err != nil {
+		if err := s.emitMissingNodeValue(member.value, out); err != nil {
 			return err
 		}
 		first = false
@@ -1241,11 +1466,46 @@ func (s *mutateStreamState) emitMissingValue(rules []mutateActiveRule, out mutat
 	if err != nil {
 		return err
 	}
-	if !cached.hasValue || len(cached.payload) == 0 {
+	if !cached.hasValue || cached.root == nil {
 		return nil
 	}
-	_, err = out.Write(cached.payload)
-	return err
+	return s.emitMissingNodeValue(cached.root, out)
+}
+
+func (s *mutateStreamState) emitMissingNodeValue(node *mutateMissingNode, out mutateByteWriter) error {
+	if node == nil {
+		return nil
+	}
+	switch node.kind {
+	case mutateMissingNodeLiteral:
+		_, err := out.Write(node.literal)
+		return err
+	case mutateMissingNodeFile:
+		return s.emitFileMutationValue(node.file, out)
+	case mutateMissingNodeObject:
+		if err := out.WriteByte('{'); err != nil {
+			return err
+		}
+		for idx, member := range node.members {
+			if idx > 0 {
+				if err := out.WriteByte(','); err != nil {
+					return err
+				}
+			}
+			if err := s.writeJSONStringString(out, member.key); err != nil {
+				return err
+			}
+			if err := out.WriteByte(':'); err != nil {
+				return err
+			}
+			if err := s.emitMissingNodeValue(member.value, out); err != nil {
+				return err
+			}
+		}
+		return out.WriteByte('}')
+	default:
+		return fmt.Errorf("unknown missing node kind")
+	}
 }
 
 func hasCreateNonWildcardRule(compiled []compiledStreamMutation, rules []mutateActiveRule) bool {
@@ -1305,7 +1565,7 @@ func simulateMutationExistence(compiled []compiledStreamMutation, rules []mutate
 	return exists
 }
 
-func (s *mutateStreamState) buildMissingObjectValues(rules []mutateActiveRule) (map[string]any, error) {
+func (s *mutateStreamState) buildMissingObjectNode(rules []mutateActiveRule) (*mutateMissingNode, error) {
 	if len(rules) == 0 {
 		return nil, nil
 	}
@@ -1348,23 +1608,77 @@ func (s *mutateStreamState) buildMissingObjectValues(rules []mutateActiveRule) (
 			}
 		}
 		relative = append(relative, Mutation{
-			Path:  path,
-			Kind:  compiled.mut.Kind,
-			Value: compiled.mut.Value,
-			Delta: compiled.mut.Delta,
+			Path:      path,
+			Kind:      compiled.mut.Kind,
+			Value:     compiled.mut.Value,
+			Delta:     compiled.mut.Delta,
+			fileValue: compiled.mut.fileValue,
 		})
 	}
 	if len(relative) == 0 {
 		return nil, nil
 	}
 	doc := make(map[string]any)
-	if err := ApplyMutations(doc, relative); err != nil {
+	if err := applyMissingMutationsToDoc(doc, relative); err != nil {
 		return nil, err
 	}
 	if len(doc) == 0 {
 		return nil, nil
 	}
-	return doc, nil
+	root, err := missingNodeFromAny(doc)
+	if err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return nil, nil
+	}
+	if root.kind != mutateMissingNodeObject {
+		return nil, fmt.Errorf("missing object root must be object")
+	}
+	return root, nil
+}
+
+func applyMissingMutationsToDoc(doc map[string]any, muts []Mutation) error {
+	for _, mut := range muts {
+		internal := mut
+		if mut.hasFileValue() {
+			internal.Value = &mutateMissingFileMarker{file: mut.fileValue}
+			internal.fileValue = nil
+		}
+		if err := applyMutation(doc, internal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func missingNodeFromAny(value any) (*mutateMissingNode, error) {
+	switch v := value.(type) {
+	case map[string]any:
+		node := &mutateMissingNode{kind: mutateMissingNodeObject}
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		node.members = make([]mutateMissingMember, 0, len(keys))
+		for _, key := range keys {
+			child, err := missingNodeFromAny(v[key])
+			if err != nil {
+				return nil, err
+			}
+			node.members = append(node.members, mutateMissingMember{key: key, value: child})
+		}
+		return node, nil
+	case *mutateMissingFileMarker:
+		return &mutateMissingNode{kind: mutateMissingNodeFile, file: v.file}, nil
+	default:
+		payload, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		return &mutateMissingNode{kind: mutateMissingNodeLiteral, literal: payload}, nil
+	}
 }
 
 func activeRulesEqual(a, b []mutateActiveRule) bool {
@@ -1386,7 +1700,7 @@ func (s *mutateStreamState) missingValueForRules(rules []mutateActiveRule) (*mut
 		}
 	}
 
-	doc, err := s.buildMissingObjectValues(rules)
+	root, err := s.buildMissingObjectNode(rules)
 	if err != nil {
 		return nil, err
 	}
@@ -1396,32 +1710,15 @@ func (s *mutateStreamState) missingValueForRules(rules []mutateActiveRule) (*mut
 		entry.rules = make([]mutateActiveRule, len(rules))
 		copy(entry.rules, rules)
 	}
-	if len(doc) == 0 {
+	if root == nil || len(root.members) == 0 {
 		entry.hasValue = false
 		s.missingCache = append(s.missingCache, entry)
 		return &s.missingCache[len(s.missingCache)-1], nil
 	}
 	entry.hasValue = true
-	entry.payload, err = json.Marshal(doc)
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0, len(doc))
-	for key := range doc {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	entry.members = make([]mutateMissingMember, 0, len(keys))
-	for _, key := range keys {
-		memberPayload, err := json.Marshal(doc[key])
-		if err != nil {
-			return nil, err
-		}
-		entry.members = append(entry.members, mutateMissingMember{
-			key:     key,
-			payload: memberPayload,
-		})
-	}
+	entry.root = root
+	entry.members = make([]mutateMissingMember, len(root.members))
+	copy(entry.members, root.members)
 	s.missingCache = append(s.missingCache, entry)
 	return &s.missingCache[len(s.missingCache)-1], nil
 }
