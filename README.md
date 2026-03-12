@@ -351,7 +351,8 @@ unless `-f` is used.
 
 Local file-backed mutation values are disabled by default in the CLI. Enable
 them with `-F` or `--enable-file-mutations` to use `file:/field=path`,
-`textfile:/field=path`, or `base64file:/field=path`.
+`textfile:/field=path`, or `base64file:/field=path`. Leading `~/` expands to
+the current user's home directory.
 
 ### Selection examples
 

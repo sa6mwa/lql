@@ -434,6 +434,47 @@ func TestRunMutationsFileBackedMutationsEnabled(t *testing.T) {
 	}
 }
 
+func TestRunMutationsFileBackedMutationsExpandHomePath(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if err := os.WriteFile(filepath.Join(homeDir, "blob.txt"), []byte("hello from home"), 0o600); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+	inputPath := filepath.Join(t.TempDir(), "input.json")
+	if err := os.WriteFile(inputPath, []byte(`{"id":"a"}`), 0o600); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+
+	cfg := config{
+		mutations:           stringList{`textfile:/payload=~/blob.txt`},
+		compact:             true,
+		enableFileMutations: true,
+	}
+
+	origStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writePipe
+	err = runMutations(cfg, lql.Selector{}, nil, []string{inputPath})
+	writePipe.Close()
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("runMutations: %v", err)
+	}
+
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	values := decodeJSONValues(t, output)
+	doc := values[0].(map[string]any)
+	if doc["payload"] != "hello from home" {
+		t.Fatalf("unexpected home-expanded file-backed payload: %#v", doc["payload"])
+	}
+}
+
 func TestPrintUsageIncludesFileMutationShortFlag(t *testing.T) {
 	var out bytes.Buffer
 	printUsage(&out)

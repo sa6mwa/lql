@@ -151,6 +151,24 @@ func TestParseMutationsWithOptionsParsesFileBackedMutation(t *testing.T) {
 	}
 }
 
+func TestParseMutationsWithOptionsExpandsFileBackedHomePath(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	muts, err := ParseMutationsWithOptions([]string{`textfile:/payload=~/blob.txt`}, time.Unix(1_700_000_000, 0), ParseMutationsOptions{
+		EnableFileValues: true,
+		FileValueBaseDir: "/ignored",
+	})
+	if err != nil {
+		t.Fatalf("ParseMutationsWithOptions: %v", err)
+	}
+	if len(muts) != 1 || !muts[0].hasFileValue() {
+		t.Fatalf("expected one file-backed mutation, got %#v", muts)
+	}
+	if got, want := muts[0].fileValue.path, filepath.Join(homeDir, "blob.txt"); got != want {
+		t.Fatalf("unexpected resolved home path got=%q want=%q", got, want)
+	}
+}
+
 func TestApplyMutationsRejectsFileBackedMutation(t *testing.T) {
 	tempDir := t.TempDir()
 	path := filepath.Join(tempDir, "blob.txt")

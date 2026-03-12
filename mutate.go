@@ -346,6 +346,11 @@ func resolveMutationFilePath(path string, baseDir string) (string, error) {
 	} else if strings.HasPrefix(path, `'`) && strings.HasSuffix(path, `'`) && len(path) >= 2 {
 		path = path[1 : len(path)-1]
 	}
+	var err error
+	path, err = expandMutationFileHomePath(path)
+	if err != nil {
+		return "", err
+	}
 	if filepath.IsAbs(path) {
 		return filepath.Clean(path), nil
 	}
@@ -353,6 +358,24 @@ func resolveMutationFilePath(path string, baseDir string) (string, error) {
 		return "", fmt.Errorf("relative file-backed mutation path %q requires file value base dir", path)
 	}
 	return filepath.Clean(filepath.Join(baseDir, path)), nil
+}
+
+func expandMutationFileHomePath(path string) (string, error) {
+	if path == "~" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir for file-backed mutation: %w", err)
+		}
+		return homeDir, nil
+	}
+	if !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir for file-backed mutation: %w", err)
+	}
+	return filepath.Join(homeDir, path[2:]), nil
 }
 
 func buildSetMutation(path string, literal string, timeMode bool, now time.Time) (Mutation, error) {
