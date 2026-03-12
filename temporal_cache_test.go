@@ -129,3 +129,36 @@ func TestCompileDateSinceCachedTodayMacroUsesUTC(t *testing.T) {
 		t.Fatalf("unexpected since=today value: %+v", got)
 	}
 }
+
+func TestParseTemporalLiteralNaiveDateTimeUsesUTC(t *testing.T) {
+	got, ok := parseTemporalLiteral("2026-03-11T01:11:28")
+	if !ok {
+		t.Fatalf("expected naive datetime literal to parse")
+	}
+	want := time.Date(2026, 3, 11, 1, 11, 28, 0, time.UTC)
+	if !got.instant.Equal(want) || got.dateOnly {
+		t.Fatalf("unexpected naive datetime value: %+v", got)
+	}
+}
+
+func TestParseTemporalLiteralNaiveDateTimeFractionUsesUTC(t *testing.T) {
+	got, ok := parseTemporalLiteral("2026-03-11T01:11:28.123456789")
+	if !ok {
+		t.Fatalf("expected naive datetime literal with fraction to parse")
+	}
+	want := time.Date(2026, 3, 11, 1, 11, 28, 123456789, time.UTC)
+	if !got.instant.Equal(want) || got.dateOnly {
+		t.Fatalf("unexpected naive datetime value: %+v", got)
+	}
+}
+
+func TestParseTemporalLiteralTimezoneFractionUsesRFC3339Nano(t *testing.T) {
+	got, ok := parseTemporalLiteral("2026-03-11T01:11:28.123+01:00")
+	if !ok {
+		t.Fatalf("expected timezone datetime literal with fraction to parse")
+	}
+	want := time.Date(2026, 3, 11, 1, 11, 28, 123000000, time.FixedZone("", 60*60))
+	if !got.instant.Equal(want) || got.dateOnly {
+		t.Fatalf("unexpected timezone datetime value: %+v", got)
+	}
+}

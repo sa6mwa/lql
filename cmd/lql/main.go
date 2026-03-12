@@ -669,7 +669,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Note: with -m, selectors only control which objects are mutated unless -M")
 	fmt.Fprintln(w, "      is used to output only selector matches.")
 	fmt.Fprintln(w, "Note: contains/icontains accept value=... or any=/a=... (pipe-delimited).")
-	fmt.Fprintln(w, "Note: range comparisons accept numeric or datetime literals (YYYY-MM-DD, RFC3339, RFC3339Nano).")
+	fmt.Fprintln(w, "Note: range comparisons accept numeric or datetime literals (YYYY-MM-DD, RFC3339, RFC3339Nano, or naive UTC YYYY-MM-DDTHH:MM:SS[.fffffffff]).")
 	fmt.Fprintln(w, "Note: date supports value/after/before/gt/gte/lt/lte; aliases a=after and b=before.")
 	fmt.Fprintln(w, "Note: only date{...,since=...} supports relative macros (now, today, yesterday).")
 	fmt.Fprintln(w, "Note: omitted values for contains/icontains/prefix/iprefix act as path assertions.")

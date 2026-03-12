@@ -496,6 +496,45 @@ func TestParseSelectorShorthand(t *testing.T) {
 		}
 	})
 
+	t.Run("naive datetime lt", func(t *testing.T) {
+		sel, err := ParseSelectorString(`/timestamp<2026-03-11T01:11:28`)
+		if err != nil {
+			t.Fatalf("parse shorthand naive datetime <: %v", err)
+		}
+		if sel.Range == nil {
+			t.Fatalf("expected range clause")
+		}
+		if value, ok := sel.Range.LT.DateTime(); !ok || value != "2026-03-11T01:11:28" {
+			t.Fatalf("unexpected naive datetime lt selector %+v", sel.Range)
+		}
+	})
+
+	t.Run("naive fractional datetime lt", func(t *testing.T) {
+		sel, err := ParseSelectorString(`/timestamp<2026-03-11T01:11:28.123456789`)
+		if err != nil {
+			t.Fatalf("parse shorthand naive fractional datetime <: %v", err)
+		}
+		if sel.Range == nil {
+			t.Fatalf("expected range clause")
+		}
+		if value, ok := sel.Range.LT.DateTime(); !ok || value != "2026-03-11T01:11:28.123456789" {
+			t.Fatalf("unexpected naive fractional datetime lt selector %+v", sel.Range)
+		}
+	})
+
+	t.Run("timezone fractional datetime lt", func(t *testing.T) {
+		sel, err := ParseSelectorString(`/timestamp<2026-03-11T01:11:28.123+01:00`)
+		if err != nil {
+			t.Fatalf("parse shorthand timezone fractional datetime <: %v", err)
+		}
+		if sel.Range == nil {
+			t.Fatalf("expected range clause")
+		}
+		if value, ok := sel.Range.LT.DateTime(); !ok || value != "2026-03-11T01:11:28.123+01:00" {
+			t.Fatalf("unexpected timezone fractional datetime lt selector %+v", sel.Range)
+		}
+	})
+
 	t.Run("range macro disallowed", func(t *testing.T) {
 		if _, err := ParseSelectorString(`/timestamp>=yesterday`); err == nil {
 			t.Fatalf("expected error for relative macro in shorthand range")
@@ -526,6 +565,19 @@ func TestParseSelectorDateSelectorSinceMacro(t *testing.T) {
 	}
 	if sel.Date == nil || sel.Date.Since != "yesterday" {
 		t.Fatalf("unexpected date since clause %+v", sel.Date)
+	}
+}
+
+func TestParseSelectorDateSelectorNaiveDateTimeBounds(t *testing.T) {
+	sel, err := ParseSelectorString(`date{f=/timestamp,after=2026-03-11T01:11:28,before=2026-03-11T01:11:28.999}`)
+	if err != nil {
+		t.Fatalf("parse date selector naive datetime bounds: %v", err)
+	}
+	if sel.Date == nil {
+		t.Fatalf("expected date clause")
+	}
+	if sel.Date.After != "2026-03-11T01:11:28" || sel.Date.Before != "2026-03-11T01:11:28.999" {
+		t.Fatalf("unexpected date bounds: %+v", sel.Date)
 	}
 }
 

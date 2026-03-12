@@ -46,11 +46,14 @@
 //	/status!=closed
 //	/progress>=50
 //	/timestamp>=2026-03-05T10:28:21Z
+//	/timestamp>=2026-03-11T01:11:28
 //	/timestamp<"2026-03-05T11:29:41.265+01:00"
 //
 // Temporal selector semantics:
 //
-//   - Supported temporal literals: YYYY-MM-DD, RFC3339, RFC3339Nano.
+//   - Supported temporal literals: YYYY-MM-DD, RFC3339, RFC3339Nano, and
+//     naive UTC datetimes like YYYY-MM-DDTHH:MM:SS or
+//     YYYY-MM-DDTHH:MM:SS.fffffffff.
 //   - eq is datetime-aware when both query value and field value parse as
 //     temporal values.
 //   - Date-only equality intersects timestamps by calendar date

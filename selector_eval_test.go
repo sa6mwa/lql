@@ -674,6 +674,30 @@ func TestMatchesRangeDatetimeAcrossTimezone(t *testing.T) {
 	}
 }
 
+func TestMatchesRangeNaiveDatetimeUsesUTC(t *testing.T) {
+	selector := mustParseSelector(t, `/something>=2026-03-05T10:28:21`)
+	docMatch := map[string]any{"something": "2026-03-05T11:28:21+01:00"}
+	docMiss := map[string]any{"something": "2026-03-05T10:28:20Z"}
+	if !Matches(selector, docMatch) {
+		t.Fatalf("expected naive datetime range to use UTC")
+	}
+	if Matches(selector, docMiss) {
+		t.Fatalf("expected naive datetime range miss below UTC threshold")
+	}
+}
+
+func TestMatchesDateSelectorNaiveDatetimeFractionUsesUTC(t *testing.T) {
+	selector := mustParseSelector(t, `date{f=/something,after=2026-03-05T10:28:21.123,before=2026-03-05T10:28:21.123456790}`)
+	docMatch := map[string]any{"something": "2026-03-05T10:28:21.123456789Z"}
+	docMiss := map[string]any{"something": "2026-03-05T10:28:21.123+01:00"}
+	if !Matches(selector, docMatch) {
+		t.Fatalf("expected naive fractional datetime bounds to match UTC candidate")
+	}
+	if Matches(selector, docMiss) {
+		t.Fatalf("expected naive fractional datetime bounds to miss non-UTC-equivalent candidate")
+	}
+}
+
 func TestMatchesDateSelectorBounds(t *testing.T) {
 	selector := mustParseSelector(t, `date{f=/something,after=2025-01-01,before=2025-01-03}`)
 	docMatch := map[string]any{"something": "2025-01-02T06:00:00Z"}

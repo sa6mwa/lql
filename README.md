@@ -78,6 +78,7 @@ Datetime literals are also supported in shorthand range comparisons:
 
 ```go
 sel, _ := lql.ParseSelectorString(`/timestamp>=2026-03-05T10:28:21Z`)
+sel, _ = lql.ParseSelectorString(`/timestamp>=2026-03-11T01:11:28`)
 sel, _ = lql.ParseSelectorString(`/timestamp<"2026-03-05T11:29:41.265+01:00"`)
 ```
 
@@ -110,7 +111,8 @@ sel := lql.Selector{
 
 Temporal behavior summary:
 
-- Supported temporal literals: `YYYY-MM-DD`, RFC3339, RFC3339Nano.
+- Supported temporal literals: `YYYY-MM-DD`, RFC3339, RFC3339Nano, and naive
+  UTC datetimes like `2026-03-11T01:11:28` or `2026-03-11T01:11:28.123456789`.
 - Timezones are normalized to the same instant for datetime comparison.
 - `range{...}` supports numeric or datetime bounds (`gt/gte/lt/lte`) but cannot mix numeric and datetime bounds in one clause.
 - Relative macros are only supported by `date{...,since=...}` (`now`, `today`, `yesterday`).
@@ -562,7 +564,7 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 - `contains`/`icontains` support `value=` (single term) or `any=`/`a=` (pipe-delimited terms)
 - JSON Pointer fields: `/path/to/field`
 - Shorthand: `/field=value`, `/field!=value`, `/field>=10`, `/field<5`
-- Datetime shorthand: `/timestamp>=2026-03-05T10:28:21Z`, `/timestamp<"2026-03-05T11:29:41.265+01:00"`
+- Datetime shorthand: `/timestamp>=2026-03-05T10:28:21Z`, `/timestamp>=2026-03-11T01:11:28`, `/timestamp<"2026-03-05T11:29:41.265+01:00"`
 - `range` bounds: `gt`, `gte`, `lt`, `lte` with numeric or datetime literals (single-mode per clause)
 - `date` keys: `value`, `after`/`a`, `before`/`b`, `gt`, `gte`, `lt`, `lte`, `since`
 - `date.since` macros: `now`, `today`, `yesterday`

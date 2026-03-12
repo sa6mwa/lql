@@ -37,6 +37,15 @@ func parseTemporalLiteral(raw string) (temporalValue, bool) {
 			day:     day,
 		}, true
 	}
+	if t, ok := parseNaiveDateTimeLiteral(trimmed); ok {
+		year, month, day := t.Date()
+		return temporalValue{
+			instant: t,
+			year:    year,
+			month:   month,
+			day:     day,
+		}, true
+	}
 	return temporalValue{}, false
 }
 
@@ -122,6 +131,16 @@ func parseDateOnlyLiteral(raw string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+func parseNaiveDateTimeLiteral(raw string) (time.Time, bool) {
+	if t, err := time.ParseInLocation("2006-01-02T15:04:05", raw, time.UTC); err == nil {
+		return t, true
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04:05.999999999", raw, time.UTC); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 func temporalEqual(left, right temporalValue) bool {
