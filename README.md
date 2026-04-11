@@ -577,6 +577,6 @@ one-line JSON documents and `-t` to select a prettyx theme (see `lql -h`).
 - Set: `/path=value`
 - Increment: `/path++`, `/path--`, `/path=+3`, `/path=-2`
 - Remove: `rm:/path`, `delete:/path`
-- Time: `time:/path=NOW` or RFC3339 timestamp
+- Time: `time:/path=NOW` or RFC3339Nano timestamp (`RFC3339` also accepted)
 - Brace: `/path{/a=1,/b=2}`
 - Wildcards: `*`, `[]`, `**`, `...` in path segments

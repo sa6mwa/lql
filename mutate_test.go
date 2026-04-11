@@ -119,7 +119,7 @@ func TestParseMutationsBraceAndPointer(t *testing.T) {
 	}
 	assertMutation(t, muts[5], MutationSet, []string{"state", "updated"})
 	if _, err := time.Parse(time.RFC3339Nano, muts[5].Value.(string)); err != nil {
-		t.Fatalf("expected RFC3339 timestamp, got %v", muts[5].Value)
+		t.Fatalf("expected RFC3339Nano timestamp, got %v", muts[5].Value)
 	}
 	assertMutation(t, muts[6], MutationRemove, []string{"state", "legacy"})
 }

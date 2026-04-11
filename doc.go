@@ -100,7 +100,7 @@
 //	/state/retries++             # increment by 1
 //	/state/retries=+3            # add 3
 //	rm:/state/legacy             # delete
-//	time:/state/updated=NOW      # RFC3339 timestamp
+//	time:/state/updated=NOW      # RFC3339Nano timestamp (RFC3339 also accepted)
 //
 // Mutations support the same wildcard semantics as selectors. When a wildcard
 // path segment is used, missing paths under matched nodes are skipped.
